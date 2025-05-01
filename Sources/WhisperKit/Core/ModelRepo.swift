@@ -402,4 +402,33 @@ public class ModelRepo {
 
         return sortedModels
     }
+    
+    // MARK: - Testing Support
+    
+    /// Factory method to create a ModelRepo with a specific configuration - for testing only
+    /// This allows tests to create a ModelRepo with a predefined configuration without network calls
+    #if DEBUG
+    public static func forTesting(
+        huggingFaceRepo: HuggingFaceRepo = .init(),
+        localDirectory: URL? = nil,
+        useBackgroundDownloadSession: Bool = false,
+        modelSupportConfig: ModelSupportConfig = Constants.fallbackModelSupportConfig,
+        isRemoteConfigLoaded: Bool = true
+    ) -> ModelRepo {
+        let repo = ModelRepo(
+            huggingFaceRepo: huggingFaceRepo,
+            localDirectory: localDirectory,
+            useBackgroundDownloadSession: useBackgroundDownloadSession
+        )
+        
+        // Replace the config loading task with one that immediately provides the given config
+        repo.configLoadingTask?.cancel()
+        repo.configLoadingTask = Task {
+            repo._modelSupportConfig = modelSupportConfig
+            repo.isRemoteConfigLoaded = isRemoteConfigLoaded
+        }
+        
+        return repo
+    }
+    #endif
 } 
