@@ -1038,12 +1038,16 @@ struct ContentView: View {
 
         whisperKit = nil
         Task {
-            let config = WhisperKitConfig(computeOptions: getComputeOptions(),
-                                          verbose: true,
-                                          logLevel: .debug,
-                                          prewarm: false,
-                                          load: false,
-                                          download: false)
+            // Keep the original initialization as is
+            let config = WhisperKitConfig(
+                computeOptions: getComputeOptions(),
+                verbose: true,
+                logLevel: .debug,
+                prewarm: false,
+                load: false,
+                download: false
+            )
+            
             whisperKit = try await WhisperKit(config)
             guard let whisperKit = whisperKit else {
                 return
@@ -1057,13 +1061,18 @@ struct ContentView: View {
                 // TODO: Make this configurable in the UI
                 folder = URL(fileURLWithPath: localModelPath).appendingPathComponent(model)
             } else {
-                // Download the model
-                folder = try await WhisperKit.download(variant: model, from: repoName, progressCallback: { progress in
-                    DispatchQueue.main.async {
-                        loadingProgressValue = Float(progress.fractionCompleted) * specializationProgressRatio
-                        modelState = .downloading
+                // Download the model - using the static method for backward compatibility
+                // The instance method can be used in a future update when breaking changes are acceptable
+                folder = try await WhisperKit.download(
+                    variant: model, 
+                    from: repoName, 
+                    progressCallback: { progress in
+                        DispatchQueue.main.async {
+                            loadingProgressValue = Float(progress.fractionCompleted) * specializationProgressRatio
+                            modelState = .downloading
+                        }
                     }
-                })
+                )
             }
 
             await MainActor.run {

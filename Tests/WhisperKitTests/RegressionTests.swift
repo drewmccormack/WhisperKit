@@ -117,7 +117,8 @@ class RegressionTests: XCTestCase {
     }
 
     func testModelPerformance() async throws {
-        testEnvConfigurations(defaultModels: WhisperKit.recommendedModels().supported)
+        let recommendedModels: ModelSupport = WhisperKit.recommendedModels()
+        testEnvConfigurations(defaultModels: recommendedModels.supported)
 
         // Setup test matrix
         optionsToTest = [vadDecodingOptions]
@@ -169,7 +170,9 @@ class RegressionTests: XCTestCase {
             "Audio files not found"
         ).map { $0.path() }
 
-        if WhisperKit.recommendedModels().disabled.contains(where: { $0.range(of: config.model) != nil }) {
+        // Use the synchronous version of recommendedModels with explicit type annotation
+        let recommendedModels: ModelSupport = WhisperKit.recommendedModels()
+        if recommendedModels.disabled.contains(where: { $0.range(of: config.model) != nil }) {
             throw WhisperError.modelsUnavailable("Skipping model \(config.model), disabled for \(device).")
         }
 

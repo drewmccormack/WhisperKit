@@ -15,11 +15,22 @@ public class ModelRepo {
     /// The local directory where models are stored
     public let localDirectory: URL
     
-    /// The configuration for model support
-    public private(set) var modelSupportConfig: ModelSupportConfig
-    
     /// Whether to use background download sessions
     public let useBackgroundDownloadSession: Bool
+    
+    /// Indicates whether the remote configuration has been loaded
+    public private(set) var isRemoteConfigLoaded: Bool = false
+    
+    /// The configuration for model support - starts with fallback and updates when remote config loads
+    private var _modelSupportConfig: ModelSupportConfig
+    
+    /// Task that handles the async loading of the remote configuration
+    private var configLoadingTask: Task<Void, Never>?
+    
+    /// Provides access to the current model support configuration
+    public var modelSupportConfig: ModelSupportConfig {
+        return _modelSupportConfig
+    }
     
     /// Returns the default local directory for storing models based on the repository identifier
     public static func defaultLocalDirectory(for repoIdentifier: String) -> URL {
@@ -29,19 +40,55 @@ public class ModelRepo {
     
     // MARK: - Initialization
     
+    /// Initializes a new ModelRepo instance synchronously with fallback configuration
+    /// and starts an async task to fetch the remote configuration.
     public init(
         huggingFaceRepo: HuggingFaceRepo = .init(),
         localDirectory: URL? = nil,
         useBackgroundDownloadSession: Bool = false
-    ) async throws {
+    ) {
         self.huggingFaceRepo = huggingFaceRepo
         self.useBackgroundDownloadSession = useBackgroundDownloadSession
         
         // Use provided directory or create default based on the repo
         self.localDirectory = localDirectory ?? ModelRepo.defaultLocalDirectory(for: huggingFaceRepo.identifier)
         
-        // Load model support config
-        self.modelSupportConfig = try await huggingFaceRepo.fetchModelSupportConfig()
+        // Start with fallback configuration
+        self._modelSupportConfig = Constants.fallbackModelSupportConfig
+        
+        // Start async task to fetch remote configuration
+        configLoadingTask = Task {
+            do {
+                let remoteConfig = try await huggingFaceRepo.fetchModelSupportConfig()
+                self._modelSupportConfig = remoteConfig
+                self.isRemoteConfigLoaded = true
+                Logging.debug("ModelRepo successfully loaded remote configuration")
+            } catch {
+                Logging.error("Error fetching remote config: \(error). Using fallback configuration.")
+            }
+        }
+    }
+    
+    /// Wait for the remote configuration to be loaded if it's still in progress
+    public func waitForRemoteConfig() async {
+        if let task = configLoadingTask {
+            await task.value
+        }
+    }
+    
+    /// Register a completion handler to be called when the remote configuration is loaded
+    public func whenRemoteConfigLoaded(completion: @escaping (ModelSupportConfig) -> Void) {
+        // If already loaded, call completion immediately
+        if isRemoteConfigLoaded {
+            completion(modelSupportConfig)
+            return
+        }
+        
+        // Otherwise, start a task to wait and then call completion
+        Task {
+            await waitForRemoteConfig()
+            completion(modelSupportConfig)
+        }
     }
     
     // MARK: - Device Information
