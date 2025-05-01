@@ -16,21 +16,30 @@ public class ModelRepo {
     public let localDirectory: URL
     
     /// Whether to use background download sessions
+    /// WARNING: Background downloads require additional app implementation.
+    /// Your app must implement URLSession background task handling in AppDelegate and call
+    /// `completeBackgroundDownload(for:)` when downloads finish. See Apple's documentation on
+    /// background URLSession for details.
     public let useBackgroundDownloadSession: Bool
     
     /// Indicates whether the remote configuration has been loaded
     public private(set) var isRemoteConfigLoaded: Bool = false
     
     /// The configuration for model support - starts with fallback and updates when remote config loads
-    private var _modelSupportConfig: ModelSupportConfig
+    public private(set) var modelSupportConfig: ModelSupportConfig
+    
+    /// Async property that ensures remote config is loaded before returning
+    public var resolvedModelSupportConfig: ModelSupportConfig {
+        get async {
+            if !isRemoteConfigLoaded, let task = configLoadingTask {
+                await task.value
+            }
+            return modelSupportConfig
+        }
+    }
     
     /// Task that handles the async loading of the remote configuration
     private var configLoadingTask: Task<Void, Never>?
-    
-    /// Provides access to the current model support configuration
-    public var modelSupportConfig: ModelSupportConfig {
-        return _modelSupportConfig
-    }
     
     /// Returns the default local directory for storing models based on the repository identifier
     public static func defaultLocalDirectory(for repoIdentifier: String) -> URL {
@@ -42,6 +51,14 @@ public class ModelRepo {
     
     /// Initializes a new ModelRepo instance synchronously with fallback configuration
     /// and starts an async task to fetch the remote configuration.
+    ///
+    /// - Parameters:
+    ///   - huggingFaceRepo: The Hugging Face repository configuration
+    ///   - localDirectory: The local directory where models are stored
+    ///   - useBackgroundDownloadSession: Whether to use background download sessions.
+    ///     WARNING: This requires additional app implementation to handle background task completion.
+    ///     If set to true, your app must implement URLSession background task handling in AppDelegate
+    ///     and call `completeBackgroundDownload(for:)` when downloads finish.
     public init(
         huggingFaceRepo: HuggingFaceRepo = .init(),
         localDirectory: URL? = nil,
@@ -54,40 +71,18 @@ public class ModelRepo {
         self.localDirectory = localDirectory ?? ModelRepo.defaultLocalDirectory(for: huggingFaceRepo.identifier)
         
         // Start with fallback configuration
-        self._modelSupportConfig = Constants.fallbackModelSupportConfig
+        self.modelSupportConfig = Constants.fallbackModelSupportConfig
         
         // Start async task to fetch remote configuration
         configLoadingTask = Task {
             do {
                 let remoteConfig = try await huggingFaceRepo.fetchModelSupportConfig()
-                self._modelSupportConfig = remoteConfig
+                self.modelSupportConfig = remoteConfig
                 self.isRemoteConfigLoaded = true
                 Logging.debug("ModelRepo successfully loaded remote configuration")
             } catch {
                 Logging.error("Error fetching remote config: \(error). Using fallback configuration.")
             }
-        }
-    }
-    
-    /// Wait for the remote configuration to be loaded if it's still in progress
-    public func waitForRemoteConfig() async {
-        if let task = configLoadingTask {
-            await task.value
-        }
-    }
-    
-    /// Register a completion handler to be called when the remote configuration is loaded
-    public func whenRemoteConfigLoaded(completion: @escaping (ModelSupportConfig) -> Void) {
-        // If already loaded, call completion immediately
-        if isRemoteConfigLoaded {
-            completion(modelSupportConfig)
-            return
-        }
-        
-        // Otherwise, start a task to wait and then call completion
-        Task {
-            await waitForRemoteConfig()
-            completion(modelSupportConfig)
         }
     }
     
@@ -355,6 +350,167 @@ public class ModelRepo {
         let modelFolder = localDirectory.appendingPathComponent(model)
         try FileManager.default.removeItem(at: modelFolder)
     }
+    
+    /// Deletes all downloaded models from the local directory
+    /// - Returns: Array of model names that were successfully deleted
+    @discardableResult
+    public func deleteAllDownloadedModels() throws -> [String] {
+        // Get all locally downloaded models
+        let models = try localModels()
+        var deletedModels: [String] = []
+        
+        // Track any errors that occur during deletion
+        var deletionError: Error?
+        
+        // Try to delete each model
+        for model in models {
+            do {
+                try delete(model: model)
+                deletedModels.append(model)
+            } catch {
+                // If an error occurs, remember it but continue trying to delete others
+                deletionError = error
+                Logging.error("Failed to delete model \(model): \(error)")
+            }
+        }
+        
+        // If we encountered any errors but deleted some models, throw the error after recording deletions
+        if let error = deletionError, !deletedModels.isEmpty {
+            throw error
+        }
+        
+        return deletedModels
+    }
+    
+    /// Completes a background download by moving the model from a temporary location to the final model repository
+    /// 
+    /// Call this method from your app's URLSessionDownloadDelegate when a background download completes.
+    /// This is required for apps that use background downloads with `useBackgroundDownloadSession` set to true.
+    ///
+    /// Example implementation in your AppDelegate:
+    /// ```swift
+    /// func urlSession(_ session: URLSession, 
+    ///                 downloadTask: URLSessionDownloadTask, 
+    ///                 didFinishDownloadingTo location: URL) {
+    ///     guard let originalURL = downloadTask.originalRequest?.url else {
+    ///         print("Error: Could not get original request URL")
+    ///         return
+    ///     }
+    ///     
+    ///     do {
+    ///         // Complete the download by passing both the temporary location and original URL
+    ///         let finalLocation = try modelRepo.completeBackgroundDownload(
+    ///             tempURL: location,
+    ///             originalRequestURL: originalURL
+    ///         )
+    ///         
+    ///         print("Background download completed and moved to: \(finalLocation)")
+    ///     } catch {
+    ///         print("Failed to complete background download: \(error)")
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - tempURL: The temporary URL where the downloaded files are stored
+    ///   - originalRequestURL: The original URL that was requested. This contains the model name
+    ///           in the path and is used to identify the downloaded model.
+    /// - Returns: The final URL to the model folder in the repository
+    /// - Throws: An error if the model name can't be determined or if file operations fail
+    public func completeBackgroundDownload(
+        tempURL: URL,
+        originalRequestURL: URL
+    ) throws -> URL {
+        // Extract model name from original request URL
+        let pathComponents = originalRequestURL.pathComponents
+        
+        // Check for standard model names in the path
+        let modelKeywords = ["tiny", "base", "small", "medium", "large"]
+        
+        // Try to identify the model name from the URL path
+        let modelName: String
+        
+        // Find the first path component that contains any of the model keywords
+        if let modelComponent = pathComponents.first(where: { component in 
+            modelKeywords.contains { component.contains($0) }
+        }) {
+            modelName = modelComponent
+        } else {
+            // Fallback: Use last path component
+            modelName = pathComponents.last ?? "unknown-model"
+        }
+        
+        // Create the final destination path
+        let finalModelFolder = localDirectory.appendingPathComponent(modelName)
+        
+        // Ensure the parent directory exists
+        try FileManager.default.createDirectory(
+            at: localDirectory,
+            withIntermediateDirectories: true
+        )
+        
+        // Remove the existing model folder if it exists
+        if FileManager.default.fileExists(atPath: finalModelFolder.path) {
+            try FileManager.default.removeItem(at: finalModelFolder)
+        }
+        
+        // Move the downloaded files to the final location
+        try FileManager.default.moveItem(at: tempURL, to: finalModelFolder)
+        
+        return finalModelFolder
+    }
+    
+    // MARK: - Convenience Download Methods
+    
+    /// Downloads the best model for the current device if needed and returns its name.
+    /// - Parameter progressCallback: Optional callback to track download progress
+    /// - Returns: The name of the downloaded or existing model
+    public func downloadedModelForDevice(
+        progressCallback: ((Progress) -> Void)? = nil
+    ) async throws -> String {
+        // Check if any recommended models are already downloaded
+        let downloadedModels = try downloadedRecommendedModels()
+        
+        if let firstModel = downloadedModels.first {
+            // We already have a suitable model, return its name
+            return firstModel
+        }
+        
+        // No suitable model found, download the recommended one
+        let modelSupport = await resolvedModelSupportConfig
+        let deviceModelSupport = modelSupport.modelSupport(for: Self.deviceName())
+        let modelToDownload = deviceModelSupport.default
+        
+        // Download the model and return its name
+        _ = try await download(model: modelToDownload, progressCallback: progressCallback)
+        return modelToDownload
+    }
+    
+    /// Downloads the best model for the specified languages if needed and returns its name.
+    /// - Parameters:
+    ///   - languages: Array of language codes to support
+    ///   - progressCallback: Optional callback to track download progress
+    /// - Returns: The name of the downloaded or existing model
+    public func downloadedModel(
+        forLanguages languages: [String],
+        progressCallback: ((Progress) -> Void)? = nil
+    ) async throws -> String {
+        // Check if any models supporting these languages are already downloaded
+        let downloadedModels = try downloadedRecommendedModels(forLanguages: languages)
+        
+        if let firstModel = downloadedModels.first {
+            // We already have a suitable model, return its name
+            return firstModel
+        }
+        
+        // No suitable model found, download the recommended one for these languages
+        let languageModelSupport = await recommendedModels(forLanguages: languages)
+        let modelToDownload = languageModelSupport.default
+        
+        // Download the model and return its name
+        _ = try await download(model: modelToDownload, progressCallback: progressCallback)
+        return modelToDownload
+    }
 
     // MARK: - Model Formats
 
@@ -424,7 +580,7 @@ public class ModelRepo {
         // Replace the config loading task with one that immediately provides the given config
         repo.configLoadingTask?.cancel()
         repo.configLoadingTask = Task {
-            repo._modelSupportConfig = modelSupportConfig
+            repo.modelSupportConfig = modelSupportConfig
             repo.isRemoteConfigLoaded = isRemoteConfigLoaded
         }
         

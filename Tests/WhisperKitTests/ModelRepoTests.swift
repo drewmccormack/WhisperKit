@@ -515,19 +515,51 @@ final class ModelRepoTests: XCTestCase {
         XCTAssertEqual(localModels.count, 0)
     }
     
+    func testDeleteAllDownloadedModels() async throws {
+        // Download multiple models
+        let model1Folder = try await modelRepo.download(model: "tiny")
+        let model2Folder = try await modelRepo.download(model: "base")
+        
+        // Verify they exist
+        XCTAssertTrue(FileManager.default.fileExists(atPath: model1Folder.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: model2Folder.path))
+        
+        // Verify we have 2 models locally
+        let modelsBeforeDelete = try modelRepo.localModels()
+        XCTAssertEqual(modelsBeforeDelete.count, 2)
+        XCTAssertTrue(modelsBeforeDelete.contains("tiny"))
+        XCTAssertTrue(modelsBeforeDelete.contains("base"))
+        
+        // Delete all models
+        let deletedModels = try modelRepo.deleteAllDownloadedModels()
+        
+        // Verify the returned list contains both models
+        XCTAssertEqual(deletedModels.count, 2)
+        XCTAssertTrue(deletedModels.contains("tiny"))
+        XCTAssertTrue(deletedModels.contains("base"))
+        
+        // Verify the models are no longer on disk
+        XCTAssertFalse(FileManager.default.fileExists(atPath: model1Folder.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: model2Folder.path))
+        
+        // Verify no models are reported as local
+        let modelsAfterDelete = try modelRepo.localModels()
+        XCTAssertEqual(modelsAfterDelete.count, 0)
+    }
+    
     // MARK: - Remote Config Tests
     
     func testWaitForRemoteConfig() async {
         // Since this is an async test, we need to ensure we wait long enough
         // but don't want to actually do network requests in unit tests
-        await modelRepo.waitForRemoteConfig()
+        _ = await modelRepo.resolvedModelSupportConfig
         
         // After waiting, the config should still be available (fallback if remote failed)
         XCTAssertNotNil(modelRepo.modelSupportConfig)
     }
     
     func testRemoteConfigCompletionHandler() async {
-        // Test the completion handler approach using the forTesting factory method
+        // Test the async approach using the forTesting factory method
         let customConfig = ModelSupportConfig(
             repoName: "test-completion-handler",
             repoVersion: "1.0-test",
@@ -544,18 +576,9 @@ final class ModelRepoTests: XCTestCase {
             modelSupportConfig: customConfig
         )
         
-        // Create expectation for completion handler
-        let expectation = XCTestExpectation(description: "Remote config loaded callback")
-        
-        // Use the completion handler
-        testRepo.whenRemoteConfigLoaded { config in
-            // Config should be provided to the callback
-            XCTAssertEqual(config.repoName, customConfig.repoName)
-            expectation.fulfill()
-        }
-        
-        // Wait for the expectation with a reasonable timeout
-        await fulfillment(of: [expectation], timeout: 1.0)
+        // Test the async property
+        let config = await testRepo.resolvedModelSupportConfig
+        XCTAssertEqual(config.repoName, customConfig.repoName)
     }
     
     func testDownloadedRecommendedModels() async throws {
