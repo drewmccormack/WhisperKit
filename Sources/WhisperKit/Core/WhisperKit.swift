@@ -22,9 +22,6 @@ open class WhisperKit {
     public var modelCompute: ModelComputeOptions
     public var audioInputConfig: AudioInputConfig
     public var tokenizer: WhisperTokenizer?
-    
-    /// Model management
-    public let modelRepo: ModelRepo
 
     /// Protocols
     public var audioProcessor: any AudioProcessing
@@ -68,29 +65,12 @@ open class WhisperKit {
         useBackgroundDownloadSession = config.useBackgroundDownloadSession
         currentTimings = TranscriptionTimings()
         Logging.shared.logLevel = config.verbose ? config.logLevel : .none
-        
-        // Create a default HuggingFaceRepo
-        let repoId = config.modelRepo ?? "argmaxinc/whisperkit-coreml"
-        let hfRepo = HuggingFaceRepo(
-            repoId,
-            token: config.modelToken,
-            downloadBase: config.downloadBase ?? HuggingFaceRepo.defaultDownloadBase
-        )
-        
-        // Create a ModelRepo with the model folder as local directory if provided
-        let localDirectory = config.modelFolder != nil 
-            ? URL(fileURLWithPath: config.modelFolder!)
-            : nil
-        
-        // Create a ModelRepo (now synchronous)
-        modelRepo = ModelRepo(
-            huggingFaceRepo: hfRepo,
-            localDirectory: localDirectory,
-            useBackgroundDownloadSession: useBackgroundDownloadSession
-        )
 
         try await setupModels(
             model: config.model,
+            downloadBase: config.downloadBase,
+            modelRepo: config.modelRepo,
+            modelToken: config.modelToken,
             modelFolder: config.modelFolder,
             download: config.download
         )
@@ -101,7 +81,7 @@ open class WhisperKit {
         }
 
         // If load is not passed in, load based on whether a modelFolder is passed
-        if config.load ?? (self.modelFolder != nil) {
+        if config.load ?? (config.modelFolder != nil) {
             Logging.info("Loading models...")
             try await loadModels()
         }
@@ -111,7 +91,6 @@ open class WhisperKit {
         model: String? = nil,
         downloadBase: URL? = nil,
         modelRepo: String? = nil,
-        modelToken: String? = nil,
         modelFolder: String? = nil,
         tokenizerFolder: URL? = nil,
         computeOptions: ModelComputeOptions? = nil,
@@ -132,7 +111,6 @@ open class WhisperKit {
             model: model,
             downloadBase: downloadBase,
             modelRepo: modelRepo,
-            modelToken: modelToken,
             modelFolder: modelFolder,
             tokenizerFolder: tokenizerFolder,
             computeOptions: computeOptions,
@@ -151,199 +129,70 @@ open class WhisperKit {
         )
         try await self.init(config)
     }
-    
-    /// Initialize WhisperKit with an existing ModelRepo
-    public init(
-        modelRepo: ModelRepo,
-        model: String? = nil,
-        tokenizerFolder: URL? = nil,
-        computeOptions: ModelComputeOptions? = nil,
-        audioProcessor: (any AudioProcessing)? = nil,
-        featureExtractor: (any FeatureExtracting)? = nil,
-        audioEncoder: (any AudioEncoding)? = nil,
-        textDecoder: (any TextDecoding)? = nil,
-        logitsFilters: [any LogitsFiltering]? = nil,
-        segmentSeeker: (any SegmentSeeking)? = nil,
-        voiceActivityDetector: VoiceActivityDetector? = nil,
-        verbose: Bool = true,
-        logLevel: Logging.LogLevel = .info,
-        prewarm: Bool? = nil,
-        load: Bool? = nil,
-        download: Bool = true
-    ) async throws {
-        // ModelRepo already has the model folder configured as localDirectory
-        self.modelRepo = modelRepo
-        self.modelCompute = computeOptions ?? ModelComputeOptions()
-        self.audioInputConfig = AudioInputConfig()
-        self.audioProcessor = audioProcessor ?? AudioProcessor()
-        self.featureExtractor = featureExtractor ?? FeatureExtractor()
-        self.audioEncoder = audioEncoder ?? AudioEncoder()
-        self.textDecoder = textDecoder ?? TextDecoder()
-        self.logitsFilters = logitsFilters ?? []
-        self.segmentSeeker = segmentSeeker ?? SegmentSeeker()
-        self.voiceActivityDetector = voiceActivityDetector
-        self.tokenizerFolder = tokenizerFolder
-        self.useBackgroundDownloadSession = modelRepo.useBackgroundDownloadSession
-        self.currentTimings = TranscriptionTimings()
-        Logging.shared.logLevel = verbose ? logLevel : .none
-        
-        try await setupModels(
-            model: model,
-            download: download
-        )
-
-        if let prewarm = prewarm, prewarm {
-            Logging.info("Prewarming models...")
-            try await prewarmModels()
-        }
-
-        // If load is not passed in, load based on whether a modelFolder is passed
-        if load ?? true {
-            Logging.info("Loading models...")
-            try await loadModels()
-        }
-    }
-
-    /// Simple initializer that takes just a ModelRepo
-    public convenience init(modelRepo: ModelRepo) async throws {
-        try await self.init(
-            modelRepo: modelRepo,
-            model: nil,
-            tokenizerFolder: nil,
-            computeOptions: nil,
-            audioProcessor: nil,
-            featureExtractor: nil,
-            audioEncoder: nil,
-            textDecoder: nil,
-            logitsFilters: nil,
-            segmentSeeker: nil,
-            voiceActivityDetector: nil,
-            verbose: true,
-            logLevel: .info,
-            prewarm: true,
-            load: true,
-            download: true
-        )
-    }
 
     // MARK: - Model Loading
 
     public static func deviceName() -> String {
-        // Delegate to ModelRepo for consistent device name retrieval
-        return ModelRepo.deviceName()
+        #if !os(macOS) && !targetEnvironment(simulator)
+        var utsname = utsname()
+        uname(&utsname)
+        let deviceName = withUnsafePointer(to: &utsname.machine) {
+            $0.withMemoryRebound(to: CChar.self, capacity: Int(_SYS_NAMELEN)) {
+                String(cString: $0)
+            }
+        }
+        #else
+        let deviceName = ProcessInfo.hwModel
+        #endif
+        return deviceName
     }
 
-    @available(*, deprecated, message: "Use ModelRepo.recommendedModels(device:) instead")
-    public static func recommendedModels(forDevice deviceName: String? = nil) -> ModelSupport {
-        let effectiveDeviceName = deviceName ?? Self.deviceName()
-        Logging.debug("Running on \(effectiveDeviceName)")
-        
-        // Create a ModelRepo (now synchronous) and use the current config (which starts with fallback)
-        let repo = ModelRepo()
-        return repo.recommendedModels(device: effectiveDeviceName)
-    }
-
-    // Non-async convenience method for backward compatibility
-    @available(*, deprecated, message: "Use ModelRepo.recommendedModels() instead")
     public static func recommendedModels() -> ModelSupport {
-        return recommendedModels(forDevice: nil)
+        let deviceName = Self.deviceName()
+        Logging.debug("Running on \(deviceName)")
+        return modelSupport(for: deviceName)
     }
 
-    /// Explicitly wait for and fetch the remote model configuration
-    /// This method is async and will wait for the remote config to be loaded
-    @available(*, deprecated, message: "Use a ModelRepo instance and waitForRemoteConfig() instead")
-    public static func fetchRemoteModelConfig() async -> ModelSupportConfig {
-        let repo = ModelRepo()
-        await repo.waitForRemoteConfig()
-        return repo.modelSupportConfig
-    }
-
-    @available(*, deprecated, message: "Use fetchRemoteModelConfig() and then modelSupportConfig.modelSupport()")
-    public static func fetchRemoteRecommendedModels(
-        from repo: String = "argmaxinc/whisperkit-coreml",
-        downloadBase: URL? = nil,
-        token: String? = nil
-    ) async -> ModelSupport {
-        // Create a HuggingFaceRepo
-        let hfRepo = HuggingFaceRepo(
-            repo,
-            token: token,
-            downloadBase: downloadBase ?? HuggingFaceRepo.defaultDownloadBase
-        )
-        
-        // Create a ModelRepo with the HuggingFaceRepo
-        let modelRepo = ModelRepo(huggingFaceRepo: hfRepo)
-        
-        // Wait for the remote config to be loaded
-        await modelRepo.waitForRemoteConfig()
-        
-        return modelRepo.recommendedModels(device: Self.deviceName())
-    }
-
-    @available(*, deprecated, message: "Use ModelRepo with HuggingFaceRepo for model recommendations instead")
     public static func recommendedRemoteModels(
         from repo: String = "argmaxinc/whisperkit-coreml",
         downloadBase: URL? = nil,
         token: String? = nil
     ) async -> ModelSupport {
         let deviceName = Self.deviceName()
-        
-        // Create a HuggingFaceRepo
-        let hfRepo = HuggingFaceRepo(
-            repo,
-            token: token,
-            downloadBase: downloadBase ?? HuggingFaceRepo.defaultDownloadBase
-        )
-        
-        // Create a ModelRepo with the HuggingFaceRepo (now synchronous)
-        let modelRepo = ModelRepo(huggingFaceRepo: hfRepo)
-        
-        // Wait for the remote config to be loaded
-        await modelRepo.waitForRemoteConfig()
-        
-        return modelRepo.recommendedModels(device: deviceName)
+        let config = await Self.fetchModelSupportConfig(from: repo, downloadBase: downloadBase, token: token)
+        return modelSupport(for: deviceName, from: config)
     }
 
-    @available(*, deprecated, message: "Use HuggingFaceRepo.fetchModelSupportConfig() instead")
     public static func fetchModelSupportConfig(
         from repo: String = "argmaxinc/whisperkit-coreml",
         downloadBase: URL? = nil,
         token: String? = nil
     ) async -> ModelSupportConfig {
-        // Create a HuggingFaceRepo
-        let hfRepo = HuggingFaceRepo(
-            repo,
-            token: token,
-            downloadBase: downloadBase ?? HuggingFaceRepo.defaultDownloadBase
-        )
-        
-        // Use the HuggingFaceRepo to fetch the model support config
-        return try! await hfRepo.fetchModelSupportConfig()
+        let hubApi = HubApi(downloadBase: downloadBase, hfToken: token)
+        var modelSupportConfig = Constants.fallbackModelSupportConfig
+
+        do {
+            // Try to decode config.json into ModelSupportConfig
+            let configUrl = try await hubApi.snapshot(from: repo, matching: "config*")
+            let decoder = JSONDecoder()
+            let jsonData = try Data(contentsOf: configUrl.appendingPathComponent("config.json"))
+            modelSupportConfig = try decoder.decode(ModelSupportConfig.self, from: jsonData)
+        } catch {
+            // Allow this to fail gracefully as it uses fallback config by default
+            Logging.error(error)
+        }
+
+        return modelSupportConfig
     }
 
-    @available(*, deprecated, message: "Use ModelRepo methods to query available models instead")
     public static func fetchAvailableModels(
         from repo: String = "argmaxinc/whisperkit-coreml",
         matching: [String] = ["*"],
         downloadBase: URL? = nil,
         token: String? = nil
     ) async throws -> [String] {
-        // Create a HuggingFaceRepo
-        let hfRepo = HuggingFaceRepo(
-            repo,
-            token: token,
-            downloadBase: downloadBase ?? HuggingFaceRepo.defaultDownloadBase
-        )
-        
-        // Create a ModelRepo with the HuggingFaceRepo (now synchronous)
-        let modelRepo = ModelRepo(huggingFaceRepo: hfRepo)
-        
-        // Wait for the remote config to be loaded
-        await modelRepo.waitForRemoteConfig()
-        
-        let modelSupportConfig = modelRepo.modelSupportConfig
+        let modelSupportConfig = await fetchModelSupportConfig(from: repo, downloadBase: downloadBase, token: token)
         let supportedModels = modelSupportConfig.modelSupport().supported
-        
         var filteredSupportSet: Set<String> = []
         for glob in matching {
             filteredSupportSet = filteredSupportSet.union(supportedModels.matching(glob: glob))
@@ -353,13 +202,42 @@ open class WhisperKit {
         return formatModelFiles(filteredSupport)
     }
 
-    @available(*, deprecated, message: "Use ModelRepo.formatModelFiles() instead")
     public static func formatModelFiles(_ modelFiles: [String]) -> [String] {
-        // Delegate to ModelRepo's implementation for consistency
-        return ModelRepo.formatModelFiles(modelFiles)
+        let modelFilters = ModelVariant.allCases.map { "\($0.description)\($0.description.contains("large") ? "" : "/")" } // Include quantized models for large
+        let modelVariants = modelFiles.map { $0.components(separatedBy: "/")[0] + "/" }
+        let filteredVariants = Set(modelVariants.filter { item in
+            let count = modelFilters.reduce(0) { count, filter in
+                let isContained = item.contains(filter) ? 1 : 0
+                return count + isContained
+            }
+            return count > 0
+        })
+
+        let availableModels = filteredVariants.map { variant -> String in
+            variant.trimmingFromEnd(character: "/", upto: 1)
+        }
+
+        // Sorting order based on enum
+        let sizeOrder = ModelVariant.allCases.map { $0.description }
+
+        let sortedModels = availableModels.sorted { firstModel, secondModel in
+            // Extract the base size without any additional qualifiers
+            let firstModelBase = sizeOrder.first(where: { firstModel.contains($0) }) ?? ""
+            let secondModelBase = sizeOrder.first(where: { secondModel.contains($0) }) ?? ""
+
+            if firstModelBase == secondModelBase {
+                // If base sizes are the same, sort alphabetically
+                return firstModel < secondModel
+            } else {
+                // Sort based on the size order
+                return sizeOrder.firstIndex(of: firstModelBase) ?? sizeOrder.count
+                    < sizeOrder.firstIndex(of: secondModelBase) ?? sizeOrder.count
+            }
+        }
+
+        return sortedModels
     }
 
-    @available(*, deprecated, message: "Use an instance of WhisperKit with its modelRepo property instead: `whisperKit.modelRepo.download(model:progressCallback:)`")
     public static func download(
         variant: String,
         downloadBase: URL? = nil,
@@ -368,56 +246,77 @@ open class WhisperKit {
         token: String? = nil,
         progressCallback: ((Progress) -> Void)? = nil
     ) async throws -> URL {
-        // Create a HuggingFaceRepo
-        let hfRepo = HuggingFaceRepo(
-            repo,
-            token: token, 
-            downloadBase: downloadBase ?? HuggingFaceRepo.defaultDownloadBase
-        )
-        
-        // Create a ModelRepo with the HuggingFaceRepo (now synchronous)
-        let modelRepo = ModelRepo(
-            huggingFaceRepo: hfRepo,
-            useBackgroundDownloadSession: useBackgroundSession
-        )
-        
-        return try await modelRepo.download(
-            model: variant,
-            progressCallback: progressCallback
-        )
+        let hubApi = HubApi(downloadBase: downloadBase, hfToken: token, useBackgroundSession: useBackgroundSession)
+        let repo = Hub.Repo(id: repo, type: .models)
+        let modelSearchPath = "*\(variant.description)/*"
+        do {
+            Logging.debug("Searching for models matching \"\(modelSearchPath)\" in \(repo)")
+            let modelFiles = try await hubApi.getFilenames(from: repo, matching: [modelSearchPath])
+            var uniquePaths = Set(modelFiles.map { $0.components(separatedBy: "/").first! })
+
+            var variantPath: String? = nil
+
+            if uniquePaths.count == 1 {
+                variantPath = uniquePaths.first
+            } else {
+                // If the model name search returns more than one unique model folder, then prepend the default "openai" prefix from whisperkittools to disambiguate
+                Logging.debug("Multiple models found matching \"\(modelSearchPath)\"")
+                let adjustedModelSearchPath = "*openai*\(variant.description)/*"
+                Logging.debug("Searching for models matching \"\(adjustedModelSearchPath)\" in \(repo)")
+                let adjustedModelFiles = try await hubApi.getFilenames(from: repo, matching: [adjustedModelSearchPath])
+                uniquePaths = Set(adjustedModelFiles.map { $0.components(separatedBy: "/").first! })
+
+                if uniquePaths.count == 1 {
+                    variantPath = uniquePaths.first
+                }
+            }
+
+            guard let variantPath else {
+                // If there is still ambiguity, throw an error
+                throw WhisperError.modelsUnavailable("Multiple models found matching \"\(modelSearchPath)\"")
+            }
+
+            Logging.debug("Downloading model \(variantPath)...")
+            let modelFolder = try await hubApi.snapshot(from: repo, matching: [modelSearchPath]) { progress in
+                Logging.debug(progress)
+                if let callback = progressCallback {
+                    callback(progress)
+                }
+            }
+
+            let modelFolderName = modelFolder.appending(path: variantPath)
+            return modelFolderName
+        } catch {
+            Logging.debug(error)
+            throw error
+        }
     }
 
     /// Sets up the model folder either from a local path or by downloading from a repository.
     open func setupModels(
         model: String?,
-        modelFolder: String? = nil,
+        downloadBase: URL? = nil,
+        modelRepo: String?,
+        modelToken: String? = nil,
+        modelFolder: String?,
         download: Bool
     ) async throws {
-        // If a local model folder is provided, use it
+        // If a local model folder is provided, use it; otherwise, download the model
         if let folder = modelFolder {
             self.modelFolder = URL(fileURLWithPath: folder)
-            return
-        }
-        
-        try await setupModels(model: model, download: download)
-    }
-
-    /// Sets up the model using the modelRepo instance.
-    open func setupModels(
-        model: String?,
-        download: Bool
-    ) async throws {
-        // Handle based on whether we should download
-        if download {
-            // Get the model variant to use
-            let modelSupport = modelRepo.recommendedModels()
+        } else if download {
+            // Determine the model variant to use
+            let repo = modelRepo ?? "argmaxinc/whisperkit-coreml"
+            let modelSupport = await WhisperKit.recommendedRemoteModels(from: repo, downloadBase: downloadBase)
             let modelVariant = model ?? modelSupport.default
 
             do {
-                // Download using modelRepo and set modelFolder to the downloaded location
-                self.modelFolder = try await modelRepo.download(
-                    model: modelVariant,
-                    progressCallback: nil
+                self.modelFolder = try await Self.download(
+                    variant: modelVariant,
+                    downloadBase: downloadBase,
+                    useBackgroundSession: useBackgroundDownloadSession,
+                    from: repo,
+                    token: modelToken
                 )
             } catch {
                 // Handle errors related to model downloading
@@ -425,17 +324,6 @@ open class WhisperKit {
                 Model not found. Please check the model or repo name and try again.
                 Error: \(error)
                 """)
-            }
-        } else {
-            // If we're not downloading and no specific folder was provided,
-            // see if ModelRepo has any downloaded models we can use
-            do {
-                let localModels = try modelRepo.localModels()
-                if let firstModel = localModels.first {
-                    self.modelFolder = modelRepo.localDirectory.appendingPathComponent(firstModel)
-                }
-            } catch {
-                Logging.error("Error checking for local models: \(error)")
             }
         }
     }
@@ -1055,68 +943,5 @@ open class WhisperKit {
             }
             throw error
         }
-    }
-
-    /// Gets the model folder for a specific model from the ModelRepo
-    private func modelFolder(for model: String) -> URL {
-        return modelRepo.localDirectory.appendingPathComponent(model)
-    }
-
-    /// Downloads a model using the configured modelRepo
-    /// 
-    /// This is the preferred way to download models as it uses the instance's 
-    /// modelRepo configuration.
-    ///
-    /// - Parameters:
-    ///   - model: The model variant to download
-    ///   - progressCallback: Optional callback for download progress
-    /// - Returns: URL to the downloaded model folder
-    public func download(
-        model: String,
-        progressCallback: ((Progress) -> Void)? = nil
-    ) async throws -> URL {
-        return try await modelRepo.download(
-            model: model,
-            progressCallback: progressCallback
-        )
-    }
-
-    /// Deletes a downloaded model using the configured modelRepo
-    ///
-    /// - Parameter model: The model variant to delete
-    public func deleteModel(_ model: String) throws {
-        try modelRepo.delete(model: model)
-        
-        // If the current modelFolder points to this model, reset it
-        if let currentFolder = modelFolder,
-           currentFolder.lastPathComponent == model {
-            modelFolder = nil
-        }
-    }
-
-    /// Returns the list of locally downloaded models from the configured modelRepo
-    /// 
-    /// - Returns: Array of model names that are available locally
-    /// - Throws: Error if there's an issue accessing the local directory
-    public func localModels() throws -> [String] {
-        return try modelRepo.localModels()
-    }
-
-    /// Returns the recommended models for the current device
-    /// 
-    /// - Parameter deviceName: Optional device name to get recommendations for
-    /// - Returns: ModelSupport object with recommended models
-    public func recommendedModels(device deviceName: String? = nil) -> ModelSupport {
-        return modelRepo.recommendedModels(device: deviceName)
-    }
-
-    /// Returns the recommended models for a specific language
-    /// 
-    /// - Parameters:
-    ///   - language: The language code to get model recommendations for
-    ///   - deviceName: Optional device name to get recommendations for
-    /// - Returns: ModelSupport object with recommended models for the language
-    public func recommendedModels(forLanguage language: String, device deviceName: String? = nil) -> ModelSupport {
-        return modelRepo.recommendedModels(forLanguage: language, device: deviceName)
     }
 }
