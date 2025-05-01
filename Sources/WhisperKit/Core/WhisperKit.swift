@@ -133,66 +133,86 @@ open class WhisperKit {
     // MARK: - Model Loading
 
     public static func deviceName() -> String {
-        #if !os(macOS) && !targetEnvironment(simulator)
-        var utsname = utsname()
-        uname(&utsname)
-        let deviceName = withUnsafePointer(to: &utsname.machine) {
-            $0.withMemoryRebound(to: CChar.self, capacity: Int(_SYS_NAMELEN)) {
-                String(cString: $0)
-            }
+        // Delegate to ModelRepo for consistent device name retrieval
+        return ModelRepo.deviceName()
+    }
+
+    @available(*, deprecated, message: "Use ModelRepo.recommendedModels(device:) instead")
+    public static func recommendedModels(forDevice deviceName: String? = nil) async -> ModelSupport {
+        let effectiveDeviceName = deviceName ?? Self.deviceName()
+        Logging.debug("Running on \(effectiveDeviceName)")
+        
+        // Create a temporary ModelRepo to get recommended models
+        do {
+            let repo = try await ModelRepo()
+            return repo.recommendedModels(device: effectiveDeviceName)
+        } catch {
+            Logging.error("Error creating ModelRepo: \(error). Using fallback configuration.")
+            return modelSupport(for: effectiveDeviceName)
         }
-        #else
-        let deviceName = ProcessInfo.hwModel
-        #endif
-        return deviceName
     }
 
-    public static func recommendedModels() -> ModelSupport {
-        let deviceName = Self.deviceName()
-        Logging.debug("Running on \(deviceName)")
-        return modelSupport(for: deviceName)
-    }
-
+    @available(*, deprecated, message: "Use ModelRepo with HuggingFaceRepo for model recommendations instead")
     public static func recommendedRemoteModels(
         from repo: String = "argmaxinc/whisperkit-coreml",
         downloadBase: URL? = nil,
         token: String? = nil
     ) async -> ModelSupport {
         let deviceName = Self.deviceName()
-        let config = await Self.fetchModelSupportConfig(from: repo, downloadBase: downloadBase, token: token)
-        return modelSupport(for: deviceName, from: config)
+        
+        // Create a temporary HuggingFaceRepo to fetch model support config
+        let hfRepo = HuggingFaceRepo(
+            repo,
+            token: token,
+            downloadBase: downloadBase ?? HuggingFaceRepo.defaultDownloadBase
+        )
+        
+        do {
+            // Create a ModelRepo with the HuggingFaceRepo
+            let modelRepo = try await ModelRepo(huggingFaceRepo: hfRepo)
+            return modelRepo.recommendedModels(device: deviceName)
+        } catch {
+            Logging.error("Error creating ModelRepo: \(error). Using fallback configuration.")
+            let config = await Self.fetchModelSupportConfig(from: repo, downloadBase: downloadBase, token: token)
+            return modelSupport(for: deviceName, from: config)
+        }
     }
 
+    @available(*, deprecated, message: "Use HuggingFaceRepo.fetchModelSupportConfig() instead")
     public static func fetchModelSupportConfig(
         from repo: String = "argmaxinc/whisperkit-coreml",
         downloadBase: URL? = nil,
         token: String? = nil
     ) async -> ModelSupportConfig {
-        let hubApi = HubApi(downloadBase: downloadBase, hfToken: token)
-        var modelSupportConfig = Constants.fallbackModelSupportConfig
-
-        do {
-            // Try to decode config.json into ModelSupportConfig
-            let configUrl = try await hubApi.snapshot(from: repo, matching: "config*")
-            let decoder = JSONDecoder()
-            let jsonData = try Data(contentsOf: configUrl.appendingPathComponent("config.json"))
-            modelSupportConfig = try decoder.decode(ModelSupportConfig.self, from: jsonData)
-        } catch {
-            // Allow this to fail gracefully as it uses fallback config by default
-            Logging.error(error)
-        }
-
-        return modelSupportConfig
+        // Create a temporary HuggingFaceRepo
+        let hfRepo = HuggingFaceRepo(
+            repo,
+            token: token,
+            downloadBase: downloadBase ?? HuggingFaceRepo.defaultDownloadBase
+        )
+        
+        // HuggingFaceRepo already handles errors and returns fallback config when needed
+        return try! await hfRepo.fetchModelSupportConfig()
     }
 
+    @available(*, deprecated, message: "Use ModelRepo methods to query available models instead")
     public static func fetchAvailableModels(
         from repo: String = "argmaxinc/whisperkit-coreml",
         matching: [String] = ["*"],
         downloadBase: URL? = nil,
         token: String? = nil
     ) async throws -> [String] {
-        let modelSupportConfig = await fetchModelSupportConfig(from: repo, downloadBase: downloadBase, token: token)
+        // Create a temporary HuggingFaceRepo and ModelRepo
+        let hfRepo = HuggingFaceRepo(
+            repo,
+            token: token,
+            downloadBase: downloadBase ?? HuggingFaceRepo.defaultDownloadBase
+        )
+        
+        let modelRepo = try await ModelRepo(huggingFaceRepo: hfRepo)
+        let modelSupportConfig = modelRepo.modelSupportConfig
         let supportedModels = modelSupportConfig.modelSupport().supported
+        
         var filteredSupportSet: Set<String> = []
         for glob in matching {
             filteredSupportSet = filteredSupportSet.union(supportedModels.matching(glob: glob))
@@ -202,42 +222,13 @@ open class WhisperKit {
         return formatModelFiles(filteredSupport)
     }
 
+    @available(*, deprecated, message: "Use ModelRepo.formatModelFiles() instead")
     public static func formatModelFiles(_ modelFiles: [String]) -> [String] {
-        let modelFilters = ModelVariant.allCases.map { "\($0.description)\($0.description.contains("large") ? "" : "/")" } // Include quantized models for large
-        let modelVariants = modelFiles.map { $0.components(separatedBy: "/")[0] + "/" }
-        let filteredVariants = Set(modelVariants.filter { item in
-            let count = modelFilters.reduce(0) { count, filter in
-                let isContained = item.contains(filter) ? 1 : 0
-                return count + isContained
-            }
-            return count > 0
-        })
-
-        let availableModels = filteredVariants.map { variant -> String in
-            variant.trimmingFromEnd(character: "/", upto: 1)
-        }
-
-        // Sorting order based on enum
-        let sizeOrder = ModelVariant.allCases.map { $0.description }
-
-        let sortedModels = availableModels.sorted { firstModel, secondModel in
-            // Extract the base size without any additional qualifiers
-            let firstModelBase = sizeOrder.first(where: { firstModel.contains($0) }) ?? ""
-            let secondModelBase = sizeOrder.first(where: { secondModel.contains($0) }) ?? ""
-
-            if firstModelBase == secondModelBase {
-                // If base sizes are the same, sort alphabetically
-                return firstModel < secondModel
-            } else {
-                // Sort based on the size order
-                return sizeOrder.firstIndex(of: firstModelBase) ?? sizeOrder.count
-                    < sizeOrder.firstIndex(of: secondModelBase) ?? sizeOrder.count
-            }
-        }
-
-        return sortedModels
+        // Delegate to ModelRepo's implementation for consistency
+        return ModelRepo.formatModelFiles(modelFiles)
     }
 
+    @available(*, deprecated, message: "Use ModelRepo.download(model:progressCallback:) instead")
     public static func download(
         variant: String,
         downloadBase: URL? = nil,
@@ -246,50 +237,22 @@ open class WhisperKit {
         token: String? = nil,
         progressCallback: ((Progress) -> Void)? = nil
     ) async throws -> URL {
-        let hubApi = HubApi(downloadBase: downloadBase, hfToken: token, useBackgroundSession: useBackgroundSession)
-        let repo = Hub.Repo(id: repo, type: .models)
-        let modelSearchPath = "*\(variant.description)/*"
-        do {
-            Logging.debug("Searching for models matching \"\(modelSearchPath)\" in \(repo)")
-            let modelFiles = try await hubApi.getFilenames(from: repo, matching: [modelSearchPath])
-            var uniquePaths = Set(modelFiles.map { $0.components(separatedBy: "/").first! })
-
-            var variantPath: String? = nil
-
-            if uniquePaths.count == 1 {
-                variantPath = uniquePaths.first
-            } else {
-                // If the model name search returns more than one unique model folder, then prepend the default "openai" prefix from whisperkittools to disambiguate
-                Logging.debug("Multiple models found matching \"\(modelSearchPath)\"")
-                let adjustedModelSearchPath = "*openai*\(variant.description)/*"
-                Logging.debug("Searching for models matching \"\(adjustedModelSearchPath)\" in \(repo)")
-                let adjustedModelFiles = try await hubApi.getFilenames(from: repo, matching: [adjustedModelSearchPath])
-                uniquePaths = Set(adjustedModelFiles.map { $0.components(separatedBy: "/").first! })
-
-                if uniquePaths.count == 1 {
-                    variantPath = uniquePaths.first
-                }
-            }
-
-            guard let variantPath else {
-                // If there is still ambiguity, throw an error
-                throw WhisperError.modelsUnavailable("Multiple models found matching \"\(modelSearchPath)\"")
-            }
-
-            Logging.debug("Downloading model \(variantPath)...")
-            let modelFolder = try await hubApi.snapshot(from: repo, matching: [modelSearchPath]) { progress in
-                Logging.debug(progress)
-                if let callback = progressCallback {
-                    callback(progress)
-                }
-            }
-
-            let modelFolderName = modelFolder.appending(path: variantPath)
-            return modelFolderName
-        } catch {
-            Logging.debug(error)
-            throw error
-        }
+        // Create a temporary HuggingFaceRepo and ModelRepo
+        let hfRepo = HuggingFaceRepo(
+            repo,
+            token: token, 
+            downloadBase: downloadBase ?? HuggingFaceRepo.defaultDownloadBase
+        )
+        
+        let modelRepo = try await ModelRepo(
+            huggingFaceRepo: hfRepo,
+            useBackgroundDownloadSession: useBackgroundSession
+        )
+        
+        return try await modelRepo.download(
+            model: variant,
+            progressCallback: progressCallback
+        )
     }
 
     /// Sets up the model folder either from a local path or by downloading from a repository.
@@ -306,17 +269,27 @@ open class WhisperKit {
             self.modelFolder = URL(fileURLWithPath: folder)
         } else if download {
             // Determine the model variant to use
-            let repo = modelRepo ?? "argmaxinc/whisperkit-coreml"
-            let modelSupport = await WhisperKit.recommendedRemoteModels(from: repo, downloadBase: downloadBase)
+            let repoId = modelRepo ?? "argmaxinc/whisperkit-coreml"
+            
+            // Create a HuggingFaceRepo and ModelRepo for model management
+            let hfRepo = HuggingFaceRepo(
+                repoId,
+                token: modelToken,
+                downloadBase: downloadBase ?? HuggingFaceRepo.defaultDownloadBase
+            )
+            
+            let repo = try await ModelRepo(
+                huggingFaceRepo: hfRepo,
+                useBackgroundDownloadSession: useBackgroundDownloadSession
+            )
+            
+            let modelSupport = repo.recommendedModels()
             let modelVariant = model ?? modelSupport.default
 
             do {
-                self.modelFolder = try await Self.download(
-                    variant: modelVariant,
-                    downloadBase: downloadBase,
-                    useBackgroundSession: useBackgroundDownloadSession,
-                    from: repo,
-                    token: modelToken
+                self.modelFolder = try await repo.download(
+                    model: modelVariant,
+                    progressCallback: nil
                 )
             } catch {
                 // Handle errors related to model downloading

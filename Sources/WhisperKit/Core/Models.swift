@@ -253,7 +253,7 @@ public struct ModelSupportConfig: Codable {
     }
 
     @available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
-    public func modelSupport(for deviceIdentifier: String = WhisperKit.deviceName()) -> ModelSupport {
+    public func modelSupport(for deviceIdentifier: String = ModelRepo.deviceName()) -> ModelSupport {
         // Find the support with the longest matching identifier prefix
         // i.e. `iPad13,16` should match exact `iPad13,16` instead of first prefix like `iPad13,1`
         var bestMatch: (support: DeviceSupport, prefixLength: Int)? = nil
