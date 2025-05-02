@@ -417,12 +417,17 @@ public class ModelRepo {
     ///                The directory itself will be copied.
     ///   - modelName: Optional name to assign to the imported model. If nil, the name of the
     ///                source directory will be used.
+    ///   - overwriteExisting: If true (default), any existing model with the same name will be
+    ///                        deleted before importing. If false, and a model with the same name
+    ///                        already exists, the function will return the URL of the existing
+    ///                        model without performing the import.
     /// - Returns: The final URL of the imported model directory within the repository.
     /// - Throws: An error if file operations (directory creation, removal, copy) fail.
     @discardableResult
     public func importModel(
         from sourceURL: URL,
-        modelName name: String? = nil
+        modelName name: String? = nil,
+        overwriteExisting: Bool = true
     ) throws -> URL {
         // Determine the final model name
         let modelNameToUse = name ?? sourceURL.lastPathComponent
@@ -430,14 +435,23 @@ public class ModelRepo {
         // Create the final destination path
         let finalModelFolder = localDirectory.appendingPathComponent(modelNameToUse)
 
+        // Check if model already exists and if we should overwrite
+        let modelExists = FileManager.default.fileExists(atPath: finalModelFolder.path)
+
+        if modelExists && !overwriteExisting {
+            // Model exists and we shouldn't overwrite, return existing path
+            Logging.debug("Model '\\(modelNameToUse)' already exists and overwriteExisting is false. Skipping import.")
+            return finalModelFolder
+        }
+
         // Ensure the parent repository directory exists
         try FileManager.default.createDirectory(
             at: localDirectory,
             withIntermediateDirectories: true
         )
 
-        // Remove the existing model folder if it exists
-        if FileManager.default.fileExists(atPath: finalModelFolder.path) {
+        // Remove the existing model folder if it exists (and we are allowed to overwrite or it didn't exist before)
+        if modelExists {
             try FileManager.default.removeItem(at: finalModelFolder)
         }
 
