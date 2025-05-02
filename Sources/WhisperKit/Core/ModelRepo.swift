@@ -3,6 +3,31 @@
 
 import Foundation
 
+/// Represents the state of the remote model support configuration loading process.
+public enum RemoteConfigState: Equatable {
+    /// The remote configuration is currently being fetched.
+    case loading
+    /// The remote configuration was successfully loaded.
+    case loaded
+    /// Fetching the remote configuration failed with an error.
+    case failed(Error)
+
+    // Custom Equatable conformance to handle the associated Error value
+    public static func == (lhs: RemoteConfigState, rhs: RemoteConfigState) -> Bool {
+        switch (lhs, rhs) {
+        case (.loading, .loading):
+            return true
+        case (.loaded, .loaded):
+            return true
+        case (.failed, .failed):
+            // Consider two .failed states equal regardless of the specific error
+            return true
+        default:
+            return false
+        }
+    }
+}
+
 /// A local repository for managing Whisper models and coordinating with a Hugging Face repo.
 /// It handles downloading, querying, and managing local models.
 @available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
@@ -25,18 +50,11 @@ public class ModelRepo {
     /// Indicates whether the remote configuration has been loaded
     public private(set) var isRemoteConfigLoaded: Bool = false
     
+    /// The state of the remote configuration loading process
+    public private(set) var remoteConfigState: RemoteConfigState = .loading
+    
     /// The configuration for model support - starts with fallback and updates when remote config loads
     public private(set) var modelSupportConfig: ModelSupportConfig
-    
-    /// Async property that ensures remote config is loaded before returning
-    public var resolvedModelSupportConfig: ModelSupportConfig {
-        get async {
-            if !isRemoteConfigLoaded, let task = configLoadingTask {
-                await task.value
-            }
-            return modelSupportConfig
-        }
-    }
     
     /// Task that handles the async loading of the remote configuration
     private var configLoadingTask: Task<Void, Never>?
@@ -59,10 +77,12 @@ public class ModelRepo {
     ///     WARNING: This requires additional app implementation to handle background task completion.
     ///     If set to true, your app must implement URLSession background task handling in AppDelegate
     ///     and call `completeBackgroundDownload(for:)` when downloads finish.
+    ///   - downloadRemoteConfig: Whether to download the remote configuration
     public init(
         huggingFaceRepo: HuggingFaceRepo = .init(),
         localDirectory: URL? = nil,
-        useBackgroundDownloadSession: Bool = false
+        useBackgroundDownloadSession: Bool = false,
+        downloadRemoteConfig: Bool = true
     ) {
         self.huggingFaceRepo = huggingFaceRepo
         self.useBackgroundDownloadSession = useBackgroundDownloadSession
@@ -73,17 +93,35 @@ public class ModelRepo {
         // Start with fallback configuration
         self.modelSupportConfig = Constants.fallbackModelSupportConfig
         
-        // Start async task to fetch remote configuration
-        configLoadingTask = Task {
-            do {
-                let remoteConfig = try await huggingFaceRepo.fetchModelSupportConfig()
-                self.modelSupportConfig = remoteConfig
-                self.isRemoteConfigLoaded = true
-                Logging.debug("ModelRepo successfully loaded remote configuration")
-            } catch {
-                Logging.error("Error fetching remote config: \(error). Using fallback configuration.")
+        // Start async task to fetch remote configuration only if requested
+        if downloadRemoteConfig {
+            self.remoteConfigState = .loading // Start in loading state
+            configLoadingTask = Task {
+                do {
+                    let remoteConfig = try await huggingFaceRepo.fetchModelSupportConfig()
+                    self.modelSupportConfig = remoteConfig
+                    self.isRemoteConfigLoaded = true
+                    self.remoteConfigState = .loaded // Update state on success
+                    Logging.debug("ModelRepo successfully loaded remote configuration")
+                } catch {
+                    self.remoteConfigState = .failed(error) // Update state on failure
+                    Logging.error("Error fetching remote config: \(error). Using fallback configuration.")
+                }
             }
+        } else {
+            // If not downloading remote, consider the fallback loaded immediately
+            self.isRemoteConfigLoaded = true
+            self.remoteConfigState = .loaded
         }
+    }
+    
+    /// Waits for the asynchronous task fetching the remote model support configuration to complete.
+    /// Call this after initializing `ModelRepo` if you need to ensure that the latest remote configuration
+    /// has been loaded (or attempted) before proceeding. Methods like `recommendedModels` use the
+    /// configuration available at the time they are called; without waiting, they might initially use
+    /// the fallback configuration.
+    public func waitForRemoteConfig() async {
+        await configLoadingTask?.value
     }
     
     // MARK: - Device Information
@@ -536,7 +574,7 @@ public class ModelRepo {
     ///   - preferredSize: Optional preferred model size. If specified, will try to use a model of this size.
     ///   - progressCallback: Optional callback to track download progress
     /// - Returns: The name of the downloaded or existing model
-    public func downloadedModelForDevice(
+    public func downloadedModel(
         preferredSize: String? = nil,
         progressCallback: ((Progress) -> Void)? = nil
     ) async throws -> String {
@@ -632,20 +670,23 @@ public class ModelRepo {
         localDirectory: URL? = nil,
         useBackgroundDownloadSession: Bool = false,
         modelSupportConfig: ModelSupportConfig = Constants.fallbackModelSupportConfig,
-        isRemoteConfigLoaded: Bool = true
+        initialRemoteConfigState: RemoteConfigState = .loaded // Default to loaded for tests
     ) -> ModelRepo {
+        // Initialize without starting the remote download task
         let repo = ModelRepo(
             huggingFaceRepo: huggingFaceRepo,
             localDirectory: localDirectory,
-            useBackgroundDownloadSession: useBackgroundDownloadSession
+            useBackgroundDownloadSession: useBackgroundDownloadSession,
+            downloadRemoteConfig: false // Explicitly disable remote config loading
         )
         
-        // Replace the config loading task with one that immediately provides the given config
-        repo.configLoadingTask?.cancel()
-        repo.configLoadingTask = Task {
-            repo.modelSupportConfig = modelSupportConfig
-            repo.isRemoteConfigLoaded = isRemoteConfigLoaded
-        }
+        // Manually set the desired state for testing
+        repo.modelSupportConfig = modelSupportConfig
+        repo.remoteConfigState = initialRemoteConfigState
+        // Determine if a config is considered "loaded" (either successfully or failed)
+        repo.isRemoteConfigLoaded = (initialRemoteConfigState != .loading)
+        
+        // No need to manage tasks here anymore
         
         return repo
     }

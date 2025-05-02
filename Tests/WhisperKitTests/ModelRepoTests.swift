@@ -452,11 +452,11 @@ final class ModelRepoTests: XCTestCase {
         
         // Should download the default model if none are downloaded
         let support = repo.modelSupport()
-        let modelName = try await repo.downloadedModelForDevice()
+        let modelName = try await repo.downloadedModel()
         XCTAssertEqual(modelName, support.default)
         
         // Should return existing model if one is downloaded
-        let existingModel = try await repo.downloadedModelForDevice()
+        let existingModel = try await repo.downloadedModel()
         XCTAssertEqual(existingModel, support.default)
     }
     
@@ -625,7 +625,7 @@ final class ModelRepoTests: XCTestCase {
     func testWaitForRemoteConfig() async {
         // Since this is an async test, we need to ensure we wait long enough
         // but don't want to actually do network requests in unit tests
-        _ = await modelRepo.resolvedModelSupportConfig
+        await modelRepo.waitForRemoteConfig()
         
         // After waiting, the config should still be available (fallback if remote failed)
         XCTAssertNotNil(modelRepo.modelSupportConfig)
@@ -650,7 +650,8 @@ final class ModelRepoTests: XCTestCase {
         )
         
         // Test the async property
-        let config = await testRepo.resolvedModelSupportConfig
+        await testRepo.waitForRemoteConfig()
+        let config = testRepo.modelSupportConfig
         XCTAssertEqual(config.repoName, customConfig.repoName)
     }
     
@@ -685,17 +686,17 @@ final class ModelRepoTests: XCTestCase {
         try createMockDownloadedModel("openai_whisper-small")
         try createMockDownloadedModel("openai_whisper-tiny")
         
-        // Test with large size preference
-        let largeModel = try await modelRepo.downloadedModelForDevice(preferredSize: "large")
-        XCTAssertTrue(largeModel.contains("large"), "Should use a large model when preferred")
-        
         // Test with small size preference
-        let smallModel = try await modelRepo.downloadedModelForDevice(preferredSize: "small")
+        let smallModel = try await modelRepo.downloadedModel(preferredSize: "small")
         XCTAssertTrue(smallModel.contains("small"), "Should use a small model when preferred")
+        
+        // Test with large size preference
+        let largeModel = try await modelRepo.downloadedModel(preferredSize: "large")
+        XCTAssertTrue(largeModel.contains("large"), "Should use a large model when preferred")
         
         // Test with invalid size preference - should fall back to default
         let support = modelRepo.modelSupport()
-        let invalidModel = try await modelRepo.downloadedModelForDevice(preferredSize: "invalid")
+        let invalidModel = try await modelRepo.downloadedModel(preferredSize: "invalid")
         XCTAssertEqual(invalidModel, support.default, "Should fall back to default model for invalid size")
     }
     
