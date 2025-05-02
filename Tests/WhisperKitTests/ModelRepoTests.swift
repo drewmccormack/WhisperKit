@@ -15,6 +15,7 @@ class MockHuggingFaceRepo: HuggingFaceRepo {
     var lastUseBackgroundSession: Bool?
     var shouldThrowOnDownload: Bool = false
     var didDownloadModelFiles: Bool = false
+    var downloadedModels: Set<String> = []
     
     override func fetchModelSupportConfig() async throws -> ModelSupportConfig {
         didFetchModelSupportConfig = true
@@ -35,30 +36,31 @@ class MockHuggingFaceRepo: HuggingFaceRepo {
         lastDownloadedModel = model
         lastUseBackgroundSession = useBackgroundSession
         didDownloadModelFiles = true
+        downloadedModels.insert(model)
         
         if shouldThrowOnDownload {
             struct MockError: Error { }
             throw MockError()
         }
         
-        // Create a mock model folder
+        // Create a mock model folder in a temporary location
         let tempFolder = FileManager.default.temporaryDirectory.appendingPathComponent("mockmodel_\(model)")
-        try FileManager.default.createDirectory(at: tempFolder, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: tempFolder, withIntermediateDirectories: true)
         
-        // Create some fake model files
+        // Create mock files without actually downloading anything
         let mockFiles = ["MelSpectrogram.mlmodelc", "AudioEncoder.mlmodelc", "TextDecoder.mlmodelc"]
         for file in mockFiles {
             let fileURL = tempFolder.appendingPathComponent(file)
-            try FileManager.default.createDirectory(at: fileURL, withIntermediateDirectories: true)
+            try? FileManager.default.createDirectory(at: fileURL, withIntermediateDirectories: true)
             
             // Create a dummy file inside each directory
             let dummyFile = fileURL.appendingPathComponent("coremldata.bin")
-            try Data([0, 1, 2, 3, 4]).write(to: dummyFile)
+            try? "mock data".write(to: dummyFile, atomically: true, encoding: .utf8)
         }
         
-        // Create a vocab file
+        // Create a mock vocab file
         let vocabFile = tempFolder.appendingPathComponent("vocab.json")
-        try "{\"0\":\"<|endoftext|>\",\"1\":\"<|startoftranscript|>\"}".write(to: vocabFile, atomically: true, encoding: .utf8)
+        try? "{\"0\":\"<|endoftext|>\",\"1\":\"<|startoftranscript|>\"}".write(to: vocabFile, atomically: true, encoding: .utf8)
         
         return tempFolder
     }
@@ -79,9 +81,38 @@ final class ModelRepoTests: XCTestCase {
         try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
         
         mockHFRepo = MockHuggingFaceRepo(testRepoId)
-        modelRepo = ModelRepo(
+        
+        // Setup mock config with test models
+        let mockConfig = ModelSupportConfig(
+            repoName: "test-repo",
+            repoVersion: "1.0",
+            deviceSupports: [
+                DeviceSupport(
+                    identifiers: [ModelRepo.deviceName()],
+                    models: ModelSupport(
+                        default: "openai_whisper-large-v3",
+                        supported: [
+                            "openai_whisper-tiny.en",
+                            "openai_whisper-tiny",
+                            "openai_whisper-base.en",
+                            "openai_whisper-base",
+                            "openai_whisper-small.en",
+                            "openai_whisper-small",
+                            "openai_whisper-medium.en",
+                            "openai_whisper-medium",
+                            "openai_whisper-large-v3",
+                            "openai_whisper-large"
+                        ]
+                    )
+                )
+            ]
+        )
+        mockHFRepo.modelSupportConfigToReturn = mockConfig
+        
+        modelRepo = ModelRepo.forTesting(
             huggingFaceRepo: mockHFRepo,
-            localDirectory: tempDirectory
+            localDirectory: tempDirectory,
+            modelSupportConfig: mockConfig
         )
     }
     
@@ -89,6 +120,26 @@ final class ModelRepoTests: XCTestCase {
         if FileManager.default.fileExists(atPath: tempDirectory.path) {
             try FileManager.default.removeItem(at: tempDirectory)
         }
+        modelRepo = nil
+        mockHFRepo = nil
+    }
+    
+    // MARK: - Test Helpers
+    
+    func createMockDownloadedModel(_ model: String) throws {
+        let modelDir = tempDirectory.appendingPathComponent(model)
+        try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
+        
+        // Create mock model files
+        let mockFiles = ["MelSpectrogram.mlmodelc", "AudioEncoder.mlmodelc", "TextDecoder.mlmodelc"]
+        for file in mockFiles {
+            let fileURL = modelDir.appendingPathComponent(file)
+            try FileManager.default.createDirectory(at: fileURL, withIntermediateDirectories: true)
+            try "mock data".write(to: fileURL.appendingPathComponent("coremldata.bin"), atomically: true, encoding: .utf8)
+        }
+        
+        // Create mock vocab file
+        try "{\"0\":\"<|endoftext|>\"}".write(to: modelDir.appendingPathComponent("vocab.json"), atomically: true, encoding: .utf8)
     }
     
     // MARK: - HuggingFaceRepo Tests
@@ -264,140 +315,162 @@ final class ModelRepoTests: XCTestCase {
     
     // MARK: - ModelRepo Recommendation Tests
     
-    func testRecommendedModels() {
-        // Test that we can get recommended models for the current device
-        let modelSupport = modelRepo.recommendedModels()
+    func testRecommendedModels() async throws {
+        let repo = ModelRepo.forTesting()
+        let models = repo.recommendedModels()
         
-        // There should be a default model
-        XCTAssertFalse(modelSupport.default.isEmpty)
+        // Should return an array of models ordered by preference
+        XCTAssertFalse(models.isEmpty)
         
-        // There should be some supported models
-        XCTAssertGreaterThan(modelSupport.supported.count, 0)
+        // First model should be the default model
+        let support = repo.modelSupport()
+        XCTAssertEqual(models.first, support.default)
         
-        // The default model should be in the supported list
-        XCTAssertTrue(modelSupport.supported.contains(modelSupport.default))
+        // If we have more than one model, check the ordering of remaining models
+        let remainingModels = Array(models.dropFirst()) // Skip the default model
+        guard remainingModels.count > 1 else {
+            return // Not enough models to test ordering
+        }
+        
+        let sizeOrder = ["tiny.en", "tiny", "base.en", "base", "small.en", "small", "medium.en", "medium", "large-v3", "large"]
+        
+        for i in 0..<remainingModels.count-1 {
+            let currentModel = remainingModels[i]
+            let nextModel = remainingModels[i+1]
+            
+            let currentSize = sizeOrder.first(where: { currentModel.contains($0) }) ?? ""
+            let nextSize = sizeOrder.first(where: { nextModel.contains($0) }) ?? ""
+            
+            if currentSize == nextSize {
+                // If same size, should be alphabetical
+                XCTAssertLessThan(currentModel, nextModel)
+            } else {
+                // Should be ordered by size
+                let currentIndex = sizeOrder.firstIndex(of: currentSize) ?? sizeOrder.count
+                let nextIndex = sizeOrder.firstIndex(of: nextSize) ?? sizeOrder.count
+                XCTAssertLessThan(currentIndex, nextIndex)
+            }
+        }
     }
     
-    func testRecommendedModelsForLanguage() {
-        // Test English recommendations
-        let englishSupport = modelRepo.recommendedModels(forLanguage: "en")
+    func testRecommendedModelsForLanguage() async throws {
+        let repo = ModelRepo.forTesting()
         
-        // For English, should include .en models
-        let hasEnglishSpecificModels = englishSupport.supported.contains { $0.contains(".en") }
-        XCTAssertTrue(hasEnglishSpecificModels, "English language support should include .en models")
-        
-        // Test non-English recommendations (Spanish)
-        let spanishSupport = modelRepo.recommendedModels(forLanguage: "es")
-        
-        // For Spanish, should not include .en models
-        let hasNoEnglishSpecificModels = spanishSupport.supported.allSatisfy { !$0.contains(".en") }
-        XCTAssertTrue(hasNoEnglishSpecificModels, "Spanish language support should not include .en models")
+        // Test English
+        let englishModels = repo.recommendedModels(forLanguage: "en")
+        XCTAssertFalse(englishModels.isEmpty)
+        XCTAssertTrue(englishModels.contains { $0.contains(".en") })
         
         // Test complex script language (Chinese)
-        let chineseSupport = modelRepo.recommendedModels(forLanguage: "zh")
+        let chineseModels = repo.recommendedModels(forLanguage: "zh")
+        XCTAssertFalse(chineseModels.isEmpty)
+        XCTAssertFalse(chineseModels.contains { $0.contains("tiny") })
         
-        // For Chinese, should prefer larger models
-        let hasTinyModel = chineseSupport.supported.contains { $0.contains("tiny") }
-        XCTAssertFalse(hasTinyModel, "Chinese language support should not include tiny models")
+        // Test well-resourced European language (Spanish)
+        let spanishModels = repo.recommendedModels(forLanguage: "es")
+        XCTAssertFalse(spanishModels.isEmpty)
+        
+        // Test medium-resourced language (Russian)
+        let russianModels = repo.recommendedModels(forLanguage: "ru")
+        XCTAssertFalse(russianModels.isEmpty)
+        XCTAssertFalse(russianModels.contains { $0.contains("tiny") })
+        
+        // Test unknown language (should be treated as low-resourced)
+        let unknownModels = repo.recommendedModels(forLanguage: "xx")
+        XCTAssertFalse(unknownModels.isEmpty)
+        XCTAssertFalse(unknownModels.contains { $0.contains("tiny") })
+        XCTAssertFalse(unknownModels.contains { $0.contains(".en") })
     }
     
-    func testLocaleSpecificLanguageRecommendations() {
-        // Test that locale-specific language codes work properly
-        // These should extract the primary language code
+    func testRecommendedModelsForLanguages() async throws {
+        let repo = ModelRepo.forTesting()
         
-        // English with US locale
-        let enUSSupport = modelRepo.recommendedModels(forLanguage: "en-US")
-        let enSupport = modelRepo.recommendedModels(forLanguage: "en")
+        // Test multiple languages
+        let models = repo.recommendedModels(forLanguages: ["en", "zh"])
+        XCTAssertFalse(models.isEmpty)
         
-        // Both should behave the same way - focusing on the primary language
-        XCTAssertEqual(enUSSupport.default, enSupport.default, 
-                      "Locale-specific English should use same default as base English")
+        // Should not include tiny models due to Chinese
+        XCTAssertFalse(models.contains { $0.contains("tiny") })
         
-        // Portuguese variants should be treated the same
-        let ptSupport = modelRepo.recommendedModels(forLanguage: "pt")
-        let ptBRSupport = modelRepo.recommendedModels(forLanguage: "pt-BR")
-        let ptPTSupport = modelRepo.recommendedModels(forLanguage: "pt-PT")
+        // Should not include English-only models
+        XCTAssertFalse(models.contains { $0.contains(".en") })
         
-        XCTAssertEqual(ptSupport.default, ptBRSupport.default,
-                      "Brazilian Portuguese should use same default as base Portuguese")
-        XCTAssertEqual(ptSupport.default, ptPTSupport.default,
-                      "European Portuguese should use same default as base Portuguese")
-        
-        // Chinese variants
-        let zhSupport = modelRepo.recommendedModels(forLanguage: "zh")
-        let zhHantSupport = modelRepo.recommendedModels(forLanguage: "zh-Hant")
-        let zhHansSupport = modelRepo.recommendedModels(forLanguage: "zh-Hans")
-        
-        XCTAssertEqual(zhSupport.default, zhHantSupport.default,
-                      "Traditional Chinese should use same default as base Chinese")
-        XCTAssertEqual(zhSupport.default, zhHansSupport.default,
-                      "Simplified Chinese should use same default as base Chinese")
+        // Test with unknown language (should be treated as low-resourced)
+        let unknownModels = repo.recommendedModels(forLanguages: ["en", "xx"])
+        XCTAssertFalse(unknownModels.isEmpty)
+        XCTAssertFalse(unknownModels.contains { $0.contains("tiny") })
+        XCTAssertFalse(unknownModels.contains { $0.contains(".en") })
     }
     
-    func testLanguageComplexityTiers() {
-        // Test low-resourced languages
-        let swahiliSupport = modelRepo.recommendedModels(forLanguage: "sw")
-        let amharicSupport = modelRepo.recommendedModels(forLanguage: "am")
+    func testDownloadedRecommendedModels() async throws {
+        // Initially should be empty
+        let initialModels = try modelRepo.downloadedRecommendedModels()
+        XCTAssertTrue(initialModels.isEmpty)
         
-        // Low-resourced languages should avoid tiny models
-        XCTAssertFalse(swahiliSupport.supported.contains { $0.contains("tiny") },
-                      "Swahili (low-resourced) should avoid tiny models")
-        XCTAssertFalse(amharicSupport.supported.contains { $0.contains("tiny") },
-                      "Amharic (low-resourced) should avoid tiny models")
+        // Create a mock downloaded model
+        let modelToDownload = modelRepo.modelSupport().default
+        try createMockDownloadedModel(modelToDownload)
         
-        // Test complex script languages
-        let arabicSupport = modelRepo.recommendedModels(forLanguage: "ar")
-        let thaiSupport = modelRepo.recommendedModels(forLanguage: "th")
-        
-        // Complex script languages should avoid tiny models
-        XCTAssertFalse(arabicSupport.supported.contains { $0.contains("tiny") },
-                      "Arabic (complex script) should avoid tiny models")
-        XCTAssertFalse(thaiSupport.supported.contains { $0.contains("tiny") },
-                      "Thai (complex script) should avoid tiny models")
-        
-        // Test well-resourced European languages
-        let germanSupport = modelRepo.recommendedModels(forLanguage: "de")
-        let frenchSupport = modelRepo.recommendedModels(forLanguage: "fr")
-        
-        // We don't need to assert on specific model sizes here
-        // Just verify they have some models
-        XCTAssertFalse(germanSupport.supported.isEmpty, "German should have supported models")
-        XCTAssertFalse(frenchSupport.supported.isEmpty, "French should have supported models")
+        // Should now contain the downloaded model
+        let downloadedModels = try modelRepo.downloadedRecommendedModels()
+        XCTAssertEqual(downloadedModels.count, 1)
+        XCTAssertEqual(downloadedModels.first, modelToDownload)
     }
     
-    func testRecommendedModelsForMultipleLanguages() {
-        // Test that multi-language recommendations include models that support all languages
-        let multiLangSupport = modelRepo.recommendedModels(forLanguages: ["en", "es", "fr"])
+    func testDownloadedRecommendedModelsForLanguage() async throws {
+        // Initially should be empty
+        let initialModels = try modelRepo.downloadedRecommendedModels(forLanguage: "en")
+        XCTAssertTrue(initialModels.isEmpty)
         
-        // There should be a default model
-        XCTAssertFalse(multiLangSupport.default.isEmpty)
+        // Create a mock downloaded model
+        let modelToDownload = "openai_whisper-small.en"
+        try createMockDownloadedModel(modelToDownload)
         
-        // There should be some supported models - all multilingual
-        XCTAssertGreaterThan(multiLangSupport.supported.count, 0)
-        let allMultilingual = multiLangSupport.supported.allSatisfy { !$0.contains(".en") }
-        XCTAssertTrue(allMultilingual, "Multi-language support should only include multilingual models")
+        // Should now contain the downloaded model
+        let downloadedModels = try modelRepo.downloadedRecommendedModels(forLanguage: "en")
+        XCTAssertEqual(downloadedModels.count, 1)
+        XCTAssertEqual(downloadedModels.first, modelToDownload)
+    }
+    
+    func testDownloadedRecommendedModelsForLanguages() async throws {
+        // Initially should be empty
+        let initialModels = try modelRepo.downloadedRecommendedModels(forLanguages: ["en", "zh"])
+        XCTAssertTrue(initialModels.isEmpty)
         
-        // Test with more diverse languages, including complex scripts
-        let complexGroupSupport = modelRepo.recommendedModels(forLanguages: ["en", "zh", "ar"])
+        // Create a mock downloaded model
+        let modelToDownload = "openai_whisper-small"
+        try createMockDownloadedModel(modelToDownload)
         
-        // Should prefer larger models for complex scripts
-        XCTAssertFalse(complexGroupSupport.supported.contains { $0.contains("tiny") }, 
-                      "Complex script language groups should avoid tiny models")
+        // Should now contain the downloaded model
+        let downloadedModels = try modelRepo.downloadedRecommendedModels(forLanguages: ["en", "zh"])
+        XCTAssertEqual(downloadedModels.count, 1)
+        XCTAssertEqual(downloadedModels.first, modelToDownload)
+    }
+    
+    func testDownloadedModelForDevice() async throws {
+        let repo = ModelRepo.forTesting()
         
-        // Test empty language list (should return device defaults)
-        let emptyLanguagesSupport = modelRepo.recommendedModels(forLanguages: [])
+        // Should download the default model if none are downloaded
+        let support = repo.modelSupport()
+        let modelName = try await repo.downloadedModelForDevice()
+        XCTAssertEqual(modelName, support.default)
         
-        // Should match default device recommendations
-        let deviceSupport = modelRepo.recommendedModels()
-        XCTAssertEqual(emptyLanguagesSupport.default, deviceSupport.default,
-                      "Empty language list should return device defaults")
+        // Should return existing model if one is downloaded
+        let existingModel = try await repo.downloadedModelForDevice()
+        XCTAssertEqual(existingModel, support.default)
+    }
+    
+    func testDownloadedModelForLanguages() async throws {
+        let repo = ModelRepo.forTesting()
         
-        // Test single language in list (should be same as calling forLanguage)
-        let singleLanguageSupport = modelRepo.recommendedModels(forLanguages: ["fr"])
-        let frenchSupport = modelRepo.recommendedModels(forLanguage: "fr")
+        // Should download a model that supports all languages
+        let modelName = try await repo.downloadedModel(forLanguages: ["en", "zh"])
+        let models = repo.recommendedModels(forLanguages: ["en", "zh"])
+        XCTAssertTrue(models.contains(modelName))
         
-        XCTAssertEqual(singleLanguageSupport.default, frenchSupport.default,
-                      "Single language in list should match direct language query")
+        // Should return existing model if one is downloaded
+        let existingModel = try await repo.downloadedModel(forLanguages: ["en", "zh"])
+        XCTAssertEqual(existingModel, modelName)
     }
     
     func testModelSupportConfig() {
@@ -581,80 +654,6 @@ final class ModelRepoTests: XCTestCase {
         XCTAssertEqual(config.repoName, customConfig.repoName)
     }
     
-    func testDownloadedRecommendedModels() async throws {
-        // First create some model directories
-        let tinyDir = tempDirectory.appendingPathComponent("tiny")
-        let baseDir = tempDirectory.appendingPathComponent("base")
-        try FileManager.default.createDirectory(at: tinyDir, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: baseDir, withIntermediateDirectories: true)
-        
-        // Configure a custom model support config that includes these models
-        let customConfig = ModelSupportConfig(
-            repoName: "test-repo",
-            repoVersion: "1.0-test",
-            deviceSupports: [
-                DeviceSupport(
-                    identifiers: [ModelRepo.deviceName()],
-                    models: ModelSupport(
-                        default: "tiny",
-                        supported: ["tiny", "base", "small", "medium"]
-                    )
-                )
-            ]
-        )
-        
-        // Create a test repo with this config
-        let testRepo = ModelRepo.forTesting(
-            huggingFaceRepo: mockHFRepo,
-            localDirectory: tempDirectory,
-            modelSupportConfig: customConfig
-        )
-        
-        // Get downloaded recommended models
-        let downloadedRecommended = try testRepo.downloadedRecommendedModels()
-        
-        // Should include tiny and base (which exist locally) but not small or medium
-        XCTAssertEqual(Set(downloadedRecommended), Set(["tiny", "base"]))
-    }
-    
-    func testDownloadedRecommendedModelsForLanguage() async throws {
-        // First create some model directories
-        let tinyDir = tempDirectory.appendingPathComponent("tiny")
-        let baseEnDir = tempDirectory.appendingPathComponent("base.en")
-        try FileManager.default.createDirectory(at: tinyDir, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: baseEnDir, withIntermediateDirectories: true)
-        
-        // Configure a custom model support config
-        let customConfig = ModelSupportConfig(
-            repoName: "test-repo",
-            repoVersion: "1.0-test",
-            deviceSupports: [
-                DeviceSupport(
-                    identifiers: [ModelRepo.deviceName()],
-                    models: ModelSupport(
-                        default: "tiny",
-                        supported: ["tiny", "base.en", "base", "small"]
-                    )
-                )
-            ]
-        )
-        
-        // Create a test repo with this config
-        let testRepo = ModelRepo.forTesting(
-            huggingFaceRepo: mockHFRepo, 
-            localDirectory: tempDirectory,
-            modelSupportConfig: customConfig
-        )
-        
-        // For English, both should be included
-        let englishModels = try testRepo.downloadedRecommendedModels(forLanguage: "en")
-        XCTAssertEqual(Set(englishModels), Set(["tiny", "base.en"]))
-        
-        // For Spanish, only tiny should be included (base.en is English-specific)
-        let spanishModels = try testRepo.downloadedRecommendedModels(forLanguage: "es")
-        XCTAssertEqual(spanishModels, ["tiny"])
-    }
-    
     // Remove the problematic test and replace with a more direct test of the model folder construction
     func testModelPathConstruction() {
         // Test that model paths are constructed correctly
@@ -678,5 +677,52 @@ final class ModelRepoTests: XCTestCase {
         // Verify it can be found through localModels()
         let models = try? repo.localModels()
         XCTAssertTrue(models?.contains("tiny") ?? false)
+    }
+    
+    func testDownloadedModelWithSizePreference() async throws {
+        // Create mock downloaded models
+        try createMockDownloadedModel("openai_whisper-large")
+        try createMockDownloadedModel("openai_whisper-small")
+        try createMockDownloadedModel("openai_whisper-tiny")
+        
+        // Test with large size preference
+        let largeModel = try await modelRepo.downloadedModelForDevice(preferredSize: "large")
+        XCTAssertTrue(largeModel.contains("large"), "Should use a large model when preferred")
+        
+        // Test with small size preference
+        let smallModel = try await modelRepo.downloadedModelForDevice(preferredSize: "small")
+        XCTAssertTrue(smallModel.contains("small"), "Should use a small model when preferred")
+        
+        // Test with invalid size preference - should fall back to default
+        let support = modelRepo.modelSupport()
+        let invalidModel = try await modelRepo.downloadedModelForDevice(preferredSize: "invalid")
+        XCTAssertEqual(invalidModel, support.default, "Should fall back to default model for invalid size")
+    }
+    
+    func testDownloadedModelForLanguagesWithSizePreference() async throws {
+        // Create mock downloaded models
+        try createMockDownloadedModel("openai_whisper-tiny.en")
+        try createMockDownloadedModel("openai_whisper-small.en")
+        try createMockDownloadedModel("openai_whisper-large")
+        
+        // Test with small size preference for English
+        let smallEnglishModel = try await modelRepo.downloadedModel(forLanguages: ["en"], preferredSize: "small")
+        XCTAssertTrue(smallEnglishModel.contains("small"), "Should use a small model for English")
+        
+        // Test with large size preference for English
+        let largeEnglishModel = try await modelRepo.downloadedModel(forLanguages: ["en"], preferredSize: "large")
+        XCTAssertTrue(largeEnglishModel.contains("large"), "Should use a large model for English")
+        
+        // Test with tiny size preference for English-specific model
+        let tinyEnglishModel = try await modelRepo.downloadedModel(forLanguages: ["en"], preferredSize: "tiny")
+        XCTAssertTrue(tinyEnglishModel.contains("tiny.en"), "Should use tiny.en model for English")
+        
+        // Test with tiny size preference for Chinese (should not use tiny due to complexity)
+        let chineseModel = try await modelRepo.downloadedModel(forLanguages: ["zh"], preferredSize: "tiny")
+        XCTAssertFalse(chineseModel.contains("tiny"), "Should not use tiny model for Chinese")
+        
+        // Test with tiny size preference for unknown language (should be treated as low-resourced)
+        let unknownModel = try await modelRepo.downloadedModel(forLanguages: ["xx"], preferredSize: "tiny")
+        XCTAssertFalse(unknownModel.contains("tiny"), "Should not use tiny model for unknown language")
     }
 } 

@@ -106,12 +106,12 @@ public class ModelRepo {
     // MARK: - Model Support
     
     /// Returns the model support for the current device
-    private func modelSupport() -> ModelSupport {
+    public func modelSupport() -> ModelSupport {
         modelSupportConfig.modelSupport(for: Self.deviceName())
     }
     
     /// Returns the model support for a specific device
-    private func modelSupport(for deviceName: String) -> ModelSupport {
+    public func modelSupport(for deviceName: String) -> ModelSupport {
         modelSupportConfig.modelSupport(for: deviceName)
     }
     
@@ -119,13 +119,11 @@ public class ModelRepo {
     /// 
     /// - Parameter deviceName: The device identifier to get model support for.
     ///   Pass nil to use the current device.
-    /// - Returns: A `ModelSupport` object with default and supported models for the device
-    public func recommendedModels(device deviceName: String? = nil) -> ModelSupport {
-        if let deviceName = deviceName {
-            return modelSupport(for: deviceName)
-        } else {
-            return modelSupport()
-        }
+    /// - Returns: An array of model names ordered by preference, with the default model first
+    ///   (if available) followed by models ordered from smallest to largest.
+    public func recommendedModels(device deviceName: String? = nil) -> [String] {
+        let support = deviceName != nil ? modelSupport(for: deviceName!) : modelSupport()
+        return orderModelsByPreference(support: support)
     }
     
     /// Returns the recommended models for a specific language, taking into account
@@ -138,21 +136,17 @@ public class ModelRepo {
     ///   - deviceName: The device identifier to get model support for.
     ///     Pass nil to use the current device.
     ///
-    /// - Returns: A `ModelSupport` object containing the default and supported models for the specified language
-    public func recommendedModels(forLanguage language: String, device deviceName: String? = nil) -> ModelSupport {
+    /// - Returns: An array of model names ordered by preference, with the default model first
+    ///   (if available) followed by models ordered from smallest to largest.
+    public func recommendedModels(forLanguage language: String, device deviceName: String? = nil) -> [String] {
         // Language categories by resource requirements and script complexity
         let englishOnly = ["en", "english"]
         let wellResourcedEuropean = ["es", "fr", "de", "it", "pt", "nl", "pl", "ro", "ca", "sv", "no", "da"]
         let mediumResourced = ["ru", "uk", "cs", "fi", "hu", "el", "tr", "bg", "sr", "hr", "sl"]
         let complexScriptOrTonal = ["zh", "ja", "ko", "ar", "hi", "th", "vi", "fa", "he", "ur"]
-        let lowResourced = ["sw", "am", "af", "as", "bn", "bs", "cy", "eo", "et", "eu", "gl", "gn", "gu", "ha", 
-                           "haw", "hy", "ig", "is", "jw", "ka", "kk", "km", "kn", "ku", "ky", "lb", "ln", 
-                           "lo", "lt", "lv", "mg", "mi", "mk", "ml", "mn", "mr", "ms", "mt", "my", "ne", 
-                           "oc", "pa", "ps", "sd", "si", "sk", "sl", "sn", "so", "sq", "su", "ta", "te", 
-                           "tg", "tk", "tl", "tt", "uz", "yi", "yo", "zu"]
-                           
+        
         // Get available models for the specified device
-        let currentSupport = recommendedModels(device: deviceName)
+        let currentSupport = deviceName != nil ? modelSupport(for: deviceName!) : modelSupport()
         let availableModels = currentSupport.supported
         
         // Extract primary language code if a locale-specific code is provided
@@ -184,8 +178,8 @@ public class ModelRepo {
             }
             
             // Further filter based on language complexity requirements
-            if complexScriptOrTonal.contains(primaryLanguageCode) || lowResourced.contains(primaryLanguageCode) {
-                // Complex scripts or low-resourced languages need at least small models, preferably large
+            if complexScriptOrTonal.contains(primaryLanguageCode) {
+                // Complex scripts need at least small models, preferably large
                 filteredModels = filteredModels.filter { model in
                     !model.contains("tiny") && (!model.contains("base") || model.contains("large"))
                 }
@@ -194,10 +188,11 @@ public class ModelRepo {
                 filteredModels = filteredModels.filter { model in
                     !model.contains("tiny")
                 }
-            } else if wellResourcedEuropean.contains(primaryLanguageCode) {
-                // Well-resourced European languages can use any model size, but prefer larger models
-                // No additional filtering required, but we explicitly check the category
-                // to avoid the warning about unused variable
+            } else if !wellResourcedEuropean.contains(primaryLanguageCode) {
+                // Unknown or low-resourced languages should avoid tiny models
+                filteredModels = filteredModels.filter { model in
+                    !model.contains("tiny")
+                }
             }
         }
         
@@ -206,15 +201,15 @@ public class ModelRepo {
             filteredModels = availableModels.filter { !$0.contains(".en") }
         }
         
-        // Use the default model from config if it's in our filtered list, otherwise pick the first filtered model
-        let defaultModel = filteredModels.contains(currentSupport.default) 
-            ? currentSupport.default 
-            : filteredModels.first ?? currentSupport.default
+        // Only include the default model if it's in our filtered list
+        let defaultModel = currentSupport.default
+        let includeDefault = filteredModels.contains(defaultModel)
         
-        return ModelSupport(
-            default: defaultModel,
+        // Order the filtered models by preference
+        return orderModelsByPreference(support: ModelSupport(
+            default: includeDefault ? defaultModel : filteredModels.first ?? defaultModel,
             supported: filteredModels
-        )
+        ))
     }
     
     /// Returns the recommended models for multiple languages, finding the smallest model
@@ -226,9 +221,9 @@ public class ModelRepo {
     ///   - deviceName: The device identifier to get model support for.
     ///     Pass nil to use the current device.
     ///
-    /// - Returns: A `ModelSupport` object containing models that support all specified languages,
-    ///   with the default being the smallest adequate model.
-    public func recommendedModels(forLanguages languages: [String], device deviceName: String? = nil) -> ModelSupport {
+    /// - Returns: An array of model names ordered by preference, with the default model first
+    ///   (if available) followed by models ordered from smallest to largest.
+    public func recommendedModels(forLanguages languages: [String], device deviceName: String? = nil) -> [String] {
         // Handle empty languages array
         if languages.isEmpty {
             return recommendedModels(device: deviceName)
@@ -244,7 +239,7 @@ public class ModelRepo {
         
         for language in languages {
             let supportForLanguage = recommendedModels(forLanguage: language, device: deviceName)
-            allLanguageModels.append(Set(supportForLanguage.supported))
+            allLanguageModels.append(Set(supportForLanguage))
         }
         
         // Find the intersection of supported models across all languages
@@ -258,18 +253,55 @@ public class ModelRepo {
         
         // Convert back to array and maintain original ordering
         let currentSupport = recommendedModels(device: deviceName)
-        let supportedModels = currentSupport.supported.filter { intersection.contains($0) }
+        let supportedModels = currentSupport.filter { intersection.contains($0) }
         
         // If no models support all languages, return the device default
         if supportedModels.isEmpty {
             return currentSupport
         }
         
-        // The first model in supportedModels is the smallest one that supports all languages
-        return ModelSupport(
-            default: supportedModels.first ?? currentSupport.default,
+        // Get the device support to determine the default model
+        let deviceSupport = deviceName != nil ? modelSupport(for: deviceName!) : modelSupport()
+        
+        // Order the filtered models by preference
+        return orderModelsByPreference(support: ModelSupport(
+            default: deviceSupport.default,
             supported: supportedModels
-        )
+        ))
+    }
+    
+    /// Orders models by preference, with the default model first (if available)
+    /// followed by models ordered from smallest to largest.
+    private func orderModelsByPreference(support: ModelSupport) -> [String] {
+        var orderedModels = [String]()
+        
+        // Start with the default model if it's in the supported list
+        if support.supported.contains(support.default) {
+            orderedModels.append(support.default)
+        }
+        
+        // Sort remaining models by size
+        let sizeOrder = ["tiny.en", "tiny", "base.en", "base", "small.en", "small", "medium.en", "medium", "large-v3", "large"]
+        let remainingModels = support.supported.filter { $0 != support.default }
+        
+        let sortedModels = remainingModels.sorted { firstModel, secondModel in
+            // Extract the base size without any additional qualifiers
+            let firstModelBase = sizeOrder.first(where: { firstModel.contains($0) }) ?? firstModel
+            let secondModelBase = sizeOrder.first(where: { secondModel.contains($0) }) ?? secondModel
+            
+            let firstIndex = sizeOrder.firstIndex(where: { firstModelBase.contains($0) }) ?? sizeOrder.count
+            let secondIndex = sizeOrder.firstIndex(where: { secondModelBase.contains($0) }) ?? sizeOrder.count
+            
+            if firstIndex == secondIndex {
+                // If same size, sort alphabetically
+                return firstModel < secondModel
+            }
+            
+            return firstIndex < secondIndex
+        }
+        
+        orderedModels.append(contentsOf: sortedModels)
+        return orderedModels
     }
     
     // MARK: - Local Models
@@ -287,15 +319,15 @@ public class ModelRepo {
     /// Returns the list of recommended models that are already downloaded
     public func downloadedRecommendedModels() throws -> [String] {
         let local = try localModels()
-        let recommended = recommendedModels().supported
-        return local.filter { recommended.contains($0) }
+        let recommended = recommendedModels()
+        return recommended.filter { local.contains($0) }
     }
     
     /// Returns the list of recommended models for a language that are already downloaded
     public func downloadedRecommendedModels(forLanguage language: String, device deviceName: String? = nil) throws -> [String] {
         let local = try localModels()
-        let recommended = recommendedModels(forLanguage: language, device: deviceName).supported
-        return local.filter { recommended.contains($0) }
+        let recommended = recommendedModels(forLanguage: language, device: deviceName)
+        return recommended.filter { local.contains($0) }
     }
     
     /// Returns the list of recommended models that support all specified languages and are already downloaded
@@ -305,14 +337,9 @@ public class ModelRepo {
     ///   - deviceName: The device identifier to get model support for. Pass nil to use the current device.
     /// - Returns: Array of downloaded models that support all the specified languages
     public func downloadedRecommendedModels(forLanguages languages: [String], device deviceName: String? = nil) throws -> [String] {
-        // Get locally downloaded models
         let local = try localModels()
-        
-        // Get models that support all specified languages
-        let recommended = recommendedModels(forLanguages: languages, device: deviceName).supported
-        
-        // Return the intersection - models that are both downloaded and support all languages
-        return local.filter { recommended.contains($0) }
+        let recommended = recommendedModels(forLanguages: languages, device: deviceName)
+        return recommended.filter { local.contains($0) }
     }
     
     // MARK: - Model Download
@@ -462,52 +489,91 @@ public class ModelRepo {
     
     // MARK: - Convenience Download Methods
     
-    /// Downloads the best model for the current device if needed and returns its name.
-    /// - Parameter progressCallback: Optional callback to track download progress
-    /// - Returns: The name of the downloaded or existing model
-    public func downloadedModelForDevice(
-        progressCallback: ((Progress) -> Void)? = nil
-    ) async throws -> String {
-        // Check if any recommended models are already downloaded
-        let downloadedModels = try downloadedRecommendedModels()
-        
-        if let firstModel = downloadedModels.first {
-            // We already have a suitable model, return its name
-            return firstModel
-        }
-        
-        // No suitable model found, download the recommended one
-        let modelSupport = await resolvedModelSupportConfig
-        let deviceModelSupport = modelSupport.modelSupport(for: Self.deviceName())
-        let modelToDownload = deviceModelSupport.default
-        
-        // Download the model and return its name
-        _ = try await download(model: modelToDownload, progressCallback: progressCallback)
-        return modelToDownload
-    }
-    
     /// Downloads the best model for the specified languages if needed and returns its name.
     /// - Parameters:
     ///   - languages: Array of language codes to support
+    ///   - preferredSize: Optional preferred model size. If specified, will try to use a model of this size.
     ///   - progressCallback: Optional callback to track download progress
     /// - Returns: The name of the downloaded or existing model
     public func downloadedModel(
         forLanguages languages: [String],
+        preferredSize: String? = nil,
         progressCallback: ((Progress) -> Void)? = nil
     ) async throws -> String {
+        // Get recommended models for these languages
+        let recommendedModels = recommendedModels(forLanguages: languages)
+        
         // Check if any models supporting these languages are already downloaded
         let downloadedModels = try downloadedRecommendedModels(forLanguages: languages)
         
+        // If we have a preferred size, try to find a model of that size
+        if let preferredSize = preferredSize {
+            // Try to find a downloaded model of the preferred size
+            if let preferredModel = downloadedModels.first(where: { $0.contains(preferredSize) }) {
+                return preferredModel
+            }
+            
+            // If no downloaded model of preferred size, try to find a recommended model of that size
+            if let modelToDownload = recommendedModels.first(where: { $0.contains(preferredSize) }) {
+                _ = try await download(model: modelToDownload, progressCallback: progressCallback)
+                return modelToDownload
+            }
+        }
+        
+        // If we have any downloaded models, use the first one
         if let firstModel = downloadedModels.first {
-            // We already have a suitable model, return its name
             return firstModel
         }
         
-        // No suitable model found, download the recommended one for these languages
-        let languageModelSupport = await recommendedModels(forLanguages: languages)
-        let modelToDownload = languageModelSupport.default
+        // No suitable model found, download the first recommended one
+        let modelToDownload = recommendedModels.first ?? modelSupport().default
+        _ = try await download(model: modelToDownload, progressCallback: progressCallback)
+        return modelToDownload
+    }
+
+    /// Downloads the best model for the current device if needed and returns its name.
+    /// - Parameters:
+    ///   - preferredSize: Optional preferred model size. If specified, will try to use a model of this size.
+    ///   - progressCallback: Optional callback to track download progress
+    /// - Returns: The name of the downloaded or existing model
+    public func downloadedModelForDevice(
+        preferredSize: String? = nil,
+        progressCallback: ((Progress) -> Void)? = nil
+    ) async throws -> String {
+        // Get recommended models for the device
+        let recommendedModels = recommendedModels()
         
-        // Download the model and return its name
+        // Check if any recommended models are already downloaded
+        let downloadedModels = try downloadedRecommendedModels()
+        
+        // If we have a preferred size, try to find a model of that size
+        if let preferredSize = preferredSize {
+            // Try to find a downloaded model of the preferred size
+            if let preferredModel = downloadedModels.first(where: { $0.contains(preferredSize) }) {
+                return preferredModel
+            }
+            
+            // If no downloaded model of preferred size, try to find a recommended model of that size
+            if let modelToDownload = recommendedModels.first(where: { $0.contains(preferredSize) }) {
+                _ = try await download(model: modelToDownload, progressCallback: progressCallback)
+                return modelToDownload
+            }
+            
+            // If preferred size is not found in recommended models, fall back to default
+            let support = modelSupport()
+            let modelToDownload = support.default
+            _ = try await download(model: modelToDownload, progressCallback: progressCallback)
+            return modelToDownload
+        }
+        
+        // If we have any downloaded models, use the first one
+        if let firstModel = downloadedModels.first {
+            return firstModel
+        }
+        
+        // No suitable model found, download the default one
+        let support = modelSupport()
+        let modelToDownload = support.default
         _ = try await download(model: modelToDownload, progressCallback: progressCallback)
         return modelToDownload
     }
@@ -524,39 +590,36 @@ public class ModelRepo {
     /// - Parameter modelFiles: The raw file or directory paths to format
     /// - Returns: An array of formatted model identifiers
     public static func formatModelFiles(_ modelFiles: [String]) -> [String] {
-        let modelFilters = ModelVariant.allCases.map { "\($0.description)\($0.description.contains("large") ? "" : "/")" } // Include quantized models for large
-        let modelVariants = modelFiles.map { $0.components(separatedBy: "/")[0] + "/" }
-        let filteredVariants = Set(modelVariants.filter { item in
-            let count = modelFilters.reduce(0) { count, filter in
-                let isContained = item.contains(filter) ? 1 : 0
-                return count + isContained
-            }
-            return count > 0
-        })
-
-        let availableModels = filteredVariants.map { variant -> String in
-            variant.trimmingFromEnd(character: "/", upto: 1)
+        // Extract model names from paths
+        let modelNames = modelFiles.map { path -> String in
+            let components = path.components(separatedBy: "/")
+            return components[0]
         }
-
-        // Sorting order based on enum
-        let sizeOrder = ModelVariant.allCases.map { $0.description }
-
-        let sortedModels = availableModels.sorted { firstModel, secondModel in
+        
+        // Sort models by size and name
+        let sizeOrder = ["tiny.en", "tiny", "base.en", "base", "small.en", "small", "medium.en", "medium", "large-v3", "large"]
+        
+        // Filter to only include valid model variants and sort them
+        let validModels = modelNames.filter { name in
+            sizeOrder.contains(where: { name.contains($0) })
+        }.sorted { firstModel, secondModel in
             // Extract the base size without any additional qualifiers
-            let firstModelBase = sizeOrder.first(where: { firstModel.contains($0) }) ?? ""
-            let secondModelBase = sizeOrder.first(where: { secondModel.contains($0) }) ?? ""
-
-            if firstModelBase == secondModelBase {
-                // If base sizes are the same, sort alphabetically
+            let firstModelBase = sizeOrder.first(where: { firstModel.contains($0) }) ?? firstModel
+            let secondModelBase = sizeOrder.first(where: { secondModel.contains($0) }) ?? secondModel
+            
+            let firstIndex = sizeOrder.firstIndex(where: { firstModelBase.contains($0) }) ?? sizeOrder.count
+            let secondIndex = sizeOrder.firstIndex(where: { secondModelBase.contains($0) }) ?? sizeOrder.count
+            
+            if firstIndex == secondIndex {
+                // If same size, sort alphabetically
                 return firstModel < secondModel
-            } else {
-                // Sort based on the size order
-                return sizeOrder.firstIndex(of: firstModelBase) ?? sizeOrder.count
-                    < sizeOrder.firstIndex(of: secondModelBase) ?? sizeOrder.count
             }
+            
+            return firstIndex < secondIndex
         }
-
-        return sortedModels
+        
+        // Remove duplicates while preserving order
+        return Array(NSOrderedSet(array: validModels)) as! [String]
     }
     
     // MARK: - Testing Support
