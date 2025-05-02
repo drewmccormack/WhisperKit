@@ -189,9 +189,9 @@ public class ModelRepo {
                     !model.contains("tiny")
                 }
             } else if !wellResourcedEuropean.contains(primaryLanguageCode) {
-                // Unknown or low-resourced languages should avoid tiny models
+                // Unknown or low-resourced languages need at least small models, similar to complex scripts
                 filteredModels = filteredModels.filter { model in
-                    !model.contains("tiny")
+                    !model.contains("tiny") && (!model.contains("base") || model.contains("large"))
                 }
             }
         }
