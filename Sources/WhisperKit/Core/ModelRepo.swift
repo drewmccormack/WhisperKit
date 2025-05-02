@@ -410,6 +410,45 @@ public class ModelRepo {
         return finalModelFolder
     }
     
+    /// Imports a model from a local file URL into the repository
+    ///
+    /// - Parameters:
+    ///   - sourceURL: The file URL pointing to the directory containing the model files to import.
+    ///                The directory itself will be copied.
+    ///   - modelName: Optional name to assign to the imported model. If nil, the name of the
+    ///                source directory will be used.
+    /// - Returns: The final URL of the imported model directory within the repository.
+    /// - Throws: An error if file operations (directory creation, removal, copy) fail.
+    @discardableResult
+    public func importModel(
+        from sourceURL: URL,
+        modelName name: String? = nil
+    ) throws -> URL {
+        // Determine the final model name
+        let modelNameToUse = name ?? sourceURL.lastPathComponent
+
+        // Create the final destination path
+        let finalModelFolder = localDirectory.appendingPathComponent(modelNameToUse)
+
+        // Ensure the parent repository directory exists
+        try FileManager.default.createDirectory(
+            at: localDirectory,
+            withIntermediateDirectories: true
+        )
+
+        // Remove the existing model folder if it exists
+        if FileManager.default.fileExists(atPath: finalModelFolder.path) {
+            try FileManager.default.removeItem(at: finalModelFolder)
+        }
+
+        // Copy the item from source URL to the final location
+        try FileManager.default.copyItem(at: sourceURL, to: finalModelFolder)
+
+        Logging.debug("Successfully imported model \\(modelNameToUse) from \\(sourceURL.path) to \\(finalModelFolder.path)")
+
+        return finalModelFolder
+    }
+    
     /// Deletes a downloaded model
     public func delete(model: String) throws {
         let modelFolder = localDirectory.appendingPathComponent(model)
