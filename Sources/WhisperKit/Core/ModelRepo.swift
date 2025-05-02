@@ -410,7 +410,10 @@ public class ModelRepo {
         return finalModelFolder
     }
     
-    /// Imports a model from a local file URL into the repository
+    /// Seeds a Hugging Face model from a local file URL into the repository
+    ///
+    /// This method is specifically for seeding models into the Hugging Face model directory
+    /// structure. It will place the model in the standard location: huggingface/models/argmaxinc/whisperkit-coreml
     ///
     /// - Parameters:
     ///   - sourceURL: The file URL pointing to the directory containing the model files to import.
@@ -424,7 +427,7 @@ public class ModelRepo {
     /// - Returns: The final URL of the imported model directory within the repository.
     /// - Throws: An error if file operations (directory creation, removal, copy) fail.
     @discardableResult
-    public func importModel(
+    public func seedHuggingFaceModel(
         from sourceURL: URL,
         modelName name: String? = nil,
         overwriteExisting: Bool = true
@@ -432,7 +435,7 @@ public class ModelRepo {
         // Determine the final model name
         let modelNameToUse = name ?? sourceURL.lastPathComponent
 
-        // Create the final destination path
+        // Create the final destination path in the standard Hugging Face location
         let finalModelFolder = localDirectory.appendingPathComponent(modelNameToUse)
 
         // Check if model already exists and if we should overwrite
@@ -458,7 +461,7 @@ public class ModelRepo {
         // Copy the item from source URL to the final location
         try FileManager.default.copyItem(at: sourceURL, to: finalModelFolder)
 
-        Logging.debug("Successfully imported model \\(modelNameToUse) from \\(sourceURL.path) to \\(finalModelFolder.path)")
+        Logging.debug("Successfully seeded model \\(modelNameToUse) from \\(sourceURL.path) to \\(finalModelFolder.path)")
 
         return finalModelFolder
     }
