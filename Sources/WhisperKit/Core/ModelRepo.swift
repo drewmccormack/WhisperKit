@@ -527,6 +527,32 @@ public class ModelRepo {
     
     // MARK: - Convenience Download Methods
     
+    /// Determines the target model name based on recommended/downloaded lists and optional size preference.
+    private func determineTargetModel(recommended: [String], downloaded: [String], preferredSize: String?, defaultModel: String) -> String {
+        // 1. Handle preferred size
+        if let preferred = preferredSize {
+            // Check if preferred size is downloaded
+            if let model = downloaded.first(where: { $0.contains(preferred) }) {
+                return model // Use downloaded preferred size
+            }
+            // Check if preferred size is recommended
+            if let model = recommended.first(where: { $0.contains(preferred) }) {
+                return model // Use recommended preferred size (will need download check later)
+            }
+            // Preferred size not found or not recommended, fall back.
+            Logging.debug("Preferred size '\\(preferred)' not found in recommended models. Falling back.")
+            // Fall through to logic below (use first downloaded, or first recommended)
+        }
+
+        // 2. No preferred size OR preferred size fallback - use first downloaded if available
+        if let model = downloaded.first {
+            return model
+        }
+
+        // 3. No preferred size/fallback, none downloaded - use first recommended or device default
+        return recommended.first ?? defaultModel
+    }
+
     /// Downloads the best model for the specified languages if needed and returns its name.
     /// - Parameters:
     ///   - languages: Array of language codes to support
@@ -538,35 +564,28 @@ public class ModelRepo {
         preferredSize: String? = nil,
         progressCallback: ((Progress) -> Void)? = nil
     ) async throws -> String {
-        // Get recommended models for these languages
-        let recommendedModels = recommendedModels(forLanguages: languages)
-        
-        // Check if any models supporting these languages are already downloaded
-        let downloadedModels = try downloadedRecommendedModels(forLanguages: languages)
-        
-        // If we have a preferred size, try to find a model of that size
-        if let preferredSize = preferredSize {
-            // Try to find a downloaded model of the preferred size
-            if let preferredModel = downloadedModels.first(where: { $0.contains(preferredSize) }) {
-                return preferredModel
-            }
-            
-            // If no downloaded model of preferred size, try to find a recommended model of that size
-            if let modelToDownload = recommendedModels.first(where: { $0.contains(preferredSize) }) {
-                _ = try await download(model: modelToDownload, progressCallback: progressCallback)
-                return modelToDownload
-            }
+        // Get recommended and downloaded models specific to the languages
+        let recommended = recommendedModels(forLanguages: languages)
+        let downloadedForLang = try downloadedRecommendedModels(forLanguages: languages)
+        let defaultModel = modelSupport().default // Use device default as ultimate fallback
+
+        // Determine the best model name to use
+        let targetModel = determineTargetModel(
+            recommended: recommended,
+            downloaded: downloadedForLang,
+            preferredSize: preferredSize,
+            defaultModel: defaultModel
+        )
+
+        // Check if the target model is already downloaded locally (check *all* local models)
+        let allDownloaded = try localModels()
+        if allDownloaded.contains(targetModel) {
+            return targetModel
+        } else {
+            // Download the target model if it's not already local
+            _ = try await download(model: targetModel, progressCallback: progressCallback)
+            return targetModel
         }
-        
-        // If we have any downloaded models, use the first one
-        if let firstModel = downloadedModels.first {
-            return firstModel
-        }
-        
-        // No suitable model found, download the first recommended one
-        let modelToDownload = recommendedModels.first ?? modelSupport().default
-        _ = try await download(model: modelToDownload, progressCallback: progressCallback)
-        return modelToDownload
     }
 
     /// Downloads the best model for the current device if needed and returns its name.
@@ -578,42 +597,27 @@ public class ModelRepo {
         preferredSize: String? = nil,
         progressCallback: ((Progress) -> Void)? = nil
     ) async throws -> String {
-        // Get recommended models for the device
-        let recommendedModels = recommendedModels()
-        
-        // Check if any recommended models are already downloaded
-        let downloadedModels = try downloadedRecommendedModels()
-        
-        // If we have a preferred size, try to find a model of that size
-        if let preferredSize = preferredSize {
-            // Try to find a downloaded model of the preferred size
-            if let preferredModel = downloadedModels.first(where: { $0.contains(preferredSize) }) {
-                return preferredModel
-            }
-            
-            // If no downloaded model of preferred size, try to find a recommended model of that size
-            if let modelToDownload = recommendedModels.first(where: { $0.contains(preferredSize) }) {
-                _ = try await download(model: modelToDownload, progressCallback: progressCallback)
-                return modelToDownload
-            }
-            
-            // If preferred size is not found in recommended models, fall back to default
-            let support = modelSupport()
-            let modelToDownload = support.default
-            _ = try await download(model: modelToDownload, progressCallback: progressCallback)
-            return modelToDownload
+        // Get recommended and downloaded models for the current device
+        let recommended = recommendedModels()
+        let downloaded = try downloadedRecommendedModels()
+        let defaultModel = modelSupport().default
+
+        // Determine the best model name to use
+        let targetModel = determineTargetModel(
+            recommended: recommended,
+            downloaded: downloaded,
+            preferredSize: preferredSize,
+            defaultModel: defaultModel
+        )
+
+        // Check if the target model is already downloaded locally
+        if downloaded.contains(targetModel) {
+            return targetModel
+        } else {
+            // Download the target model if it's not already local
+            _ = try await download(model: targetModel, progressCallback: progressCallback)
+            return targetModel
         }
-        
-        // If we have any downloaded models, use the first one
-        if let firstModel = downloadedModels.first {
-            return firstModel
-        }
-        
-        // No suitable model found, download the default one
-        let support = modelSupport()
-        let modelToDownload = support.default
-        _ = try await download(model: modelToDownload, progressCallback: progressCallback)
-        return modelToDownload
     }
 
     // MARK: - Model Formats

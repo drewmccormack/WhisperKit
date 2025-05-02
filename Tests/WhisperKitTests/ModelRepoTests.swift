@@ -694,10 +694,11 @@ final class ModelRepoTests: XCTestCase {
         let largeModel = try await modelRepo.downloadedModel(preferredSize: "large")
         XCTAssertTrue(largeModel.contains("large"), "Should use a large model when preferred")
         
-        // Test with invalid size preference - should fall back to default
-        let support = modelRepo.modelSupport()
+        // Test with invalid size preference - should fall back to the best *downloaded* model
+        let downloadedRecommended = try modelRepo.downloadedRecommendedModels()
+        let expectedFallback = try XCTUnwrap(downloadedRecommended.first, "Should have at least one downloaded model for fallback test")
         let invalidModel = try await modelRepo.downloadedModel(preferredSize: "invalid")
-        XCTAssertEqual(invalidModel, support.default, "Should fall back to default model for invalid size")
+        XCTAssertEqual(invalidModel, expectedFallback, "Should fall back to the best downloaded model for invalid size")
     }
     
     func testDownloadedModelForLanguagesWithSizePreference() async throws {
