@@ -7,9 +7,6 @@ import Hub
 /// Represents a Hugging Face repository with its identity and authentication
 @available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
 public class HuggingFaceRepo: Codable, Equatable, Hashable {
-    /// The default Hugging Face API endpoint
-    public static let defaultDownloadBase = URL(string: "https://huggingface.co/api/")!
-    
     /// The default repository owner
     public static let defaultOwner = "argmaxinc"
     
@@ -26,7 +23,7 @@ public class HuggingFaceRepo: Codable, Equatable, Hashable {
     public var token: String?
     
     /// The base URL for downloading from the repository
-    public let downloadBase: URL
+    public let downloadBase: URL?
     
     /// The full repository identifier in the format "owner/repository"
     public var identifier: String {
@@ -36,14 +33,14 @@ public class HuggingFaceRepo: Codable, Equatable, Hashable {
     public init(owner: String = HuggingFaceRepo.defaultOwner, 
                 repository: String = HuggingFaceRepo.defaultRepository, 
                 token: String? = nil, 
-                downloadBase: URL = HuggingFaceRepo.defaultDownloadBase) {
+                downloadBase: URL? = nil) {
         self.owner = owner
         self.repository = repository
         self.token = token
         self.downloadBase = downloadBase
     }
     
-    public init(_ identifier: String, token: String? = nil, downloadBase: URL = HuggingFaceRepo.defaultDownloadBase) {
+    public init(_ identifier: String, token: String? = nil, downloadBase: URL? = nil) {
         let components = identifier.components(separatedBy: "/")
         guard components.count == 2 else {
             fatalError("Invalid Hugging Face repository identifier: \(identifier). Expected format: owner/repository")
@@ -88,32 +85,57 @@ public class HuggingFaceRepo: Codable, Equatable, Hashable {
         return modelSupportConfig
     }
     
-    /// Downloads model files to a temporary location
+    /// Downloads model files, populating the specified base download location.
+    /// 
+    /// The `HubApi` used internally downloads files directly into a structure within the 
+    /// `effectiveApiDownloadBase`. If this base is a temporary location (as orchestrated by a caller like `ModelRepo`), 
+    /// the caller is then responsible for atomically moving the resulting model variant folder 
+    /// to its final persistent repository to ensure integrity.
     ///
     /// - Parameters:
-    ///   - model: The model name to download
+    ///   - model: The model name to download (used to construct glob pattern)
     ///   - useBackgroundSession: Whether to use a background download session
     ///   - progressCallback: Optional callback for download progress
-    /// - Returns: URL to the temporary folder containing the downloaded model files
+    ///   - downloadToBase: Optional URL to use as the base for HubApi downloads. If nil, uses self.downloadBase (which itself might be nil, causing HubApi to use its default).
+    /// - Returns: URL to the temporary folder containing the downloaded model variant files.
     public func downloadModelFiles(
         model: String,
         useBackgroundSession: Bool = false,
-        progressCallback: ((Progress) -> Void)? = nil
+        progressCallback: ((Progress) -> Void)? = nil,
+        downloadToBase: URL? = nil
     ) async throws -> URL {
+        // Determine the download base for HubApi for this specific operation.
+        // If `downloadToBase` is provided, it overrides `self.downloadBase` for this call.
+        // If both are nil, HubApi will use its own default (typically .../Documents/huggingface).
+        let effectiveApiDownloadBase = downloadToBase ?? self.downloadBase
+
         let hubApi = HubApi(
-            downloadBase: downloadBase,
-            hfToken: token,
+            downloadBase: effectiveApiDownloadBase, // Use the determined base
+            hfToken: self.token,
+            endpoint: "https://huggingface.co", // Explicitly set endpoint
             useBackgroundSession: useBackgroundSession
         )
+
+        let repo = Hub.Repo(id: identifier)
         
-        // Download to temporary location
-        let tempModelFolder = try await hubApi.snapshot(
-            from: identifier,
-            matching: ["*\(model)/*"]
-        ) { progress in
+        // HubApi.snapshot will download files matching "*\(model)/*" 
+        // into a structure like: effectiveApiDownloadBase/repo.type/repo.id/model/file.txt
+        // It returns the path: effectiveApiDownloadBase/repo.type/repo.id
+        let downloadedRepoRoot = try await hubApi.snapshot(from: repo, matching: ["*\(model)/*"]) { progress in
             progressCallback?(progress)
         }
+
+        // The actual model variant files are inside a subdirectory named `model` (the variant name)
+        // within this `downloadedRepoRoot`.
+        let modelVariantPathInEffectiveBase = downloadedRepoRoot.appendingPathComponent(model)
+
+        // Verify the model variant path exists after download
+        var isDirectory: ObjCBool = false
+        if !FileManager.default.fileExists(atPath: modelVariantPathInEffectiveBase.path, isDirectory: &isDirectory) || !isDirectory.boolValue {
+            let baseDesc = effectiveApiDownloadBase?.path ?? "HubApi default (Documents/huggingface)"
+            throw WhisperError.modelsUnavailable("Model variant '\(model)' not found at expected path '\(modelVariantPathInEffectiveBase.path)' after download attempt using base '\(baseDesc)'.")
+        }
         
-        return tempModelFolder
+        return modelVariantPathInEffectiveBase // Return the path to the actual model variant directory
     }
 } 

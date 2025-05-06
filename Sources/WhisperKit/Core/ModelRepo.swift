@@ -382,32 +382,56 @@ public class ModelRepo {
     
     // MARK: - Model Download
     
-    /// Downloads a model to the local directory
+    /// Downloads a model to the local directory.
+    ///
+    /// This method ensures atomicity: the model variant is first downloaded completely to a 
+    /// temporary location, and only then moved to its final destination within the repository. 
+    /// This prevents a corrupted or incomplete model in case of interruptions.
+    ///
+    /// - Parameters:
+    ///   - model: The model name to download
+    ///   - progressCallback: Optional callback to track download progress
+    /// - Returns: The final URL to the model folder in the repository
+    /// - Throws: An error if the model name can't be determined or if file operations fail
     public func download(
         model: String,
         progressCallback: ((Progress) -> Void)? = nil
     ) async throws -> URL {
-        // Download to temporary location first
-        let tempModelFolder = try await huggingFaceRepo.downloadModelFiles(
-            model: model,
-            useBackgroundSession: useBackgroundDownloadSession,
-            progressCallback: progressCallback
-        )
+        // Create a unique temporary directory for this download operation
+        let tempDownloadSessionDir = FileManager.default.temporaryDirectory.appendingPathComponent("ModelRepoDownload-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDownloadSessionDir, withIntermediateDirectories: true)
         
-        // Move to final location
-        let finalModelFolder = localDirectory.appendingPathComponent(model)
-        try FileManager.default.createDirectory(
-            at: localDirectory,
-            withIntermediateDirectories: true
-        )
-        
-        if FileManager.default.fileExists(atPath: finalModelFolder.path) {
-            try FileManager.default.removeItem(at: finalModelFolder)
+        defer {
+            // Clean up the temporary download session directory
+            try? FileManager.default.removeItem(at: tempDownloadSessionDir)
         }
+
+        // Instruct HuggingFaceRepo to download the model files using our session-specific temporary directory as the base.
+        // HuggingFaceRepo.downloadModelFiles (using HubApi) will download into a structure like:
+        // tempDownloadSessionDir/repo.type/repo.id/modelName/
+        // It will return the path: tempDownloadSessionDir/repo.type/repo.id/modelName/
+        let downloadedModelVariantInTempDir = try await huggingFaceRepo.downloadModelFiles(
+            model: model, 
+            useBackgroundSession: useBackgroundDownloadSession,
+            progressCallback: progressCallback,
+            downloadToBase: tempDownloadSessionDir 
+        )
         
-        try FileManager.default.moveItem(at: tempModelFolder, to: finalModelFolder)
-        
-        return finalModelFolder
+        // Define the final destination for the model variant within the ModelRepo's localDirectory
+        let finalModelVariantPath = localDirectory.appendingPathComponent(model)
+
+        // Ensure the parent directory for the final model path exists (e.g., .../localDirectory/)
+        try FileManager.default.createDirectory(at: localDirectory, withIntermediateDirectories: true)
+
+        // Atomically move the downloaded model variant from the temporary location to the final destination
+        // First, remove any existing model at the final destination if it exists (to allow overwrite by move)
+        if FileManager.default.fileExists(atPath: finalModelVariantPath.path) {
+            try FileManager.default.removeItem(at: finalModelVariantPath)
+        }
+        try FileManager.default.moveItem(at: downloadedModelVariantInTempDir, to: finalModelVariantPath)
+
+        Logging.debug("Model '\(model)' downloaded and moved to '\(finalModelVariantPath.path)'")
+        return finalModelVariantPath
     }
     
     /// Seeds a Hugging Face model from a local file URL into the repository
@@ -418,8 +442,6 @@ public class ModelRepo {
     /// - Parameters:
     ///   - sourceURL: The file URL pointing to the directory containing the model files to import.
     ///                The directory itself will be copied.
-    ///   - modelName: Optional name to assign to the imported model. If nil, the name of the
-    ///                source directory will be used.
     ///   - overwriteExisting: If true (default), any existing model with the same name will be
     ///                        deleted before importing. If false, and a model with the same name
     ///                        already exists, the function will return the URL of the existing
@@ -429,11 +451,26 @@ public class ModelRepo {
     @discardableResult
     public func seedHuggingFaceModel(
         from sourceURL: URL,
-        modelName name: String? = nil,
         overwriteExisting: Bool = true
     ) throws -> URL {
-        // Determine the final model name
-        let modelNameToUse = name ?? sourceURL.lastPathComponent
+        let modelConfigURL = sourceURL.appendingPathComponent("config.json")
+        var modelNameToUse: String
+
+        do {
+            let configData = try Data(contentsOf: modelConfigURL)
+            if let json = try JSONSerialization.jsonObject(with: configData) as? [String: Any],
+               let nameOrPath = json["_name_or_path"] as? String {
+                // Transform "owner/variant" to "owner_variant" for the subdirectory name
+                modelNameToUse = nameOrPath.replacingOccurrences(of: "/", with: "_")
+                Logging.debug("Derived model name '\(modelNameToUse)' from config.json (_name_or_path: \(nameOrPath))")
+            } else {
+                modelNameToUse = sourceURL.lastPathComponent
+                Logging.debug("Could not find '_name_or_path' in config.json or config.json not valid JSON. Using sourceURL.lastPathComponent: '\(modelNameToUse)'")
+            }
+        } catch {
+            modelNameToUse = sourceURL.lastPathComponent
+            Logging.debug("Could not read config.json from sourceURL. Using sourceURL.lastPathComponent: '\(modelNameToUse)'. Error: \(error)")
+        }
 
         // Create the final destination path in the standard Hugging Face location
         let finalModelFolder = localDirectory.appendingPathComponent(modelNameToUse)
