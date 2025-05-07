@@ -305,7 +305,7 @@ public class ModelRepo {
         
         if complexScriptOrTonal.contains(primaryLanguageCode) {
             filteredModels = filteredModels.filter {
-                !$0.contains("tiny") && (!$0.contains("base") || $0.contains("large"))
+                !$0.contains("tiny") && !$0.contains("base")
             }
         } else if mediumResourced.contains(primaryLanguageCode) {
             filteredModels = filteredModels.filter {
@@ -313,7 +313,7 @@ public class ModelRepo {
             }
         } else if !wellResourcedEuropean.contains(primaryLanguageCode) && !isEnglish {
             filteredModels = filteredModels.filter {
-                !$0.contains("tiny") && (!$0.contains("base") || $0.contains("large"))
+                !$0.contains("tiny") && !$0.contains("base")
             }
         }
         
