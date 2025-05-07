@@ -23,6 +23,29 @@ public enum ModelSize: String, CaseIterable, Comparable {
     }
 }
 
+/// Encapsulates constraints for model selection.
+public struct ModelConstraint {
+    public var minimumSize: ModelSize
+    public var isMultilingual: Bool
+
+    public init(minimumSize: ModelSize = .base, isMultilingual: Bool = true) {
+        self.minimumSize = minimumSize
+        self.isMultilingual = isMultilingual
+    }
+
+    /// Returns a new constraint that satisfies both this constraint and the other.
+    public func combined(with other: ModelConstraint) -> ModelConstraint {
+        let newMinimumSize = max(self.minimumSize, other.minimumSize)
+        let newIsMultilingual = self.isMultilingual || other.isMultilingual
+        return ModelConstraint(minimumSize: newMinimumSize, isMultilingual: newIsMultilingual)
+    }
+
+    /// Returns a new constraint, ensuring it is multilingual.
+    public var asMultilingual: ModelConstraint {
+        return ModelConstraint(minimumSize: self.minimumSize, isMultilingual: true)
+    }
+}
+
 /// Represents the state of the remote model support configuration loading process.
 internal enum RemoteConfigState: Equatable {
     /// The remote configuration is currently being fetched.
@@ -188,10 +211,9 @@ public class ModelRepo {
     /// - Parameters:
     ///   - language: The language code to find models for.
     ///   - deviceName: The device identifier. Pass nil for the current device.
-    ///   - multilingual: If true (default), prefers multilingual models. If false and language is English,
-    ///                   prefers English-specific (.en) models if available.
+    ///   - constraint: The constraints to apply for model selection, like minimum size and multilingual preference.
     /// - Returns: An array of model names ordered by preference.
-    public func recommendedModels(forLanguage language: String, device deviceName: String? = nil, multilingual: Bool = true) -> [String] {
+    public func recommendedModels(forLanguage language: String, device deviceName: String? = nil, constraint: ModelConstraint = ModelConstraint()) -> [String] {
         let englishOnly = ["en", "english"]
         let wellResourcedEuropean = ["es", "fr", "de", "it", "pt", "nl", "pl", "ro", "ca", "sv", "no", "da"]
         let mediumResourced = ["ru", "uk", "cs", "fi", "hu", "el", "tr", "bg", "sr", "hr", "sl"]
@@ -213,21 +235,21 @@ public class ModelRepo {
         let isEnglish = englishOnly.contains(primaryLanguageCode)
 
         if isEnglish {
-            if !multilingual {
+            if !constraint.isMultilingual {
                 let englishSpecificModels = availableModels.filter { $0.contains(".en") }
                 if !englishSpecificModels.isEmpty {
                     filteredModels = englishSpecificModels
-                    Logging.debug("Recommending English-specific models for 'en' due to multilingual:false preference.")
+                    Logging.debug("Recommending English-specific models for 'en' due to isMultilingual:false preference.")
                 } else {
                     filteredModels = availableModels.filter { !$0.contains(".") || $0.contains(".en") }
-                    Logging.debug("No English-specific (.en) models found for 'en' with multilingual:false. Falling back to general English-compatible models.")
+                    Logging.debug("No English-specific (.en) models found for 'en' with isMultilingual:false. Falling back to general English-compatible models.")
                 }
             } else {
                 filteredModels = availableModels.filter { !$0.contains(".") || $0.contains(".en") }
             }
         } else {
-            if !multilingual {
-                Logging.info("Multilingual model is required for language '\(primaryLanguageCode)'. Ignoring multilingual:false preference. Consider providing multilingual:true.")
+            if !constraint.isMultilingual {
+                Logging.info("Multilingual model is required for language '\(primaryLanguageCode)'. Ignoring isMultilingual:false preference. Consider providing isMultilingual:true.")
             }
             filteredModels = availableModels.filter { !$0.contains(".en") }
         }
@@ -272,37 +294,33 @@ public class ModelRepo {
     ///     (e.g., "en", "zh", "pt") and BCP-47 locale-specific codes (e.g., "en-US", "zh-Hant", "pt-PT").
     ///   - deviceName: The device identifier to get model support for.
     ///     Pass nil to use the current device.
-    ///   - multilingual: If true (default), prefers multilingual models. If false and languages is only English,
-    ///                   prefers English-specific (.en) models. Ignored if non-English languages are present.
+    ///   - constraint: The constraints to apply for model selection.
     /// - Returns: An array of model names ordered by preference, with the default model first
     ///   (if available) followed by models ordered from smallest to largest.
-    public func recommendedModels(forLanguages languages: [String], device deviceName: String? = nil, multilingual: Bool = true) -> [String] {
+    public func recommendedModels(forLanguages languages: [String], device deviceName: String? = nil, constraint: ModelConstraint = ModelConstraint()) -> [String] {
         if languages.isEmpty {
-            if multilingual {
+            if constraint.isMultilingual {
                 return recommendedModels(device: deviceName)
             } else {
-                // If no languages are specified but multilingual is false, assume English-focused models are desired.
-                return recommendedModels(forLanguage: "en", device: deviceName, multilingual: false)
+                // If no languages are specified but isMultilingual is false, assume English-focused models are desired.
+                return recommendedModels(forLanguage: "en", device: deviceName, constraint: ModelConstraint(isMultilingual: false))
             }
         }
         
         let isEnglishOnlyRequest = languages.allSatisfy { ["en", "english"].contains($0.lowercased()) }
 
-        if !multilingual && languages.count == 1 && isEnglishOnlyRequest {
-            return recommendedModels(forLanguage: languages.first!, device: deviceName, multilingual: false)
-        }
-
-        var effectiveMultilingual = multilingual
-        if !multilingual && !isEnglishOnlyRequest {
-            Logging.info("Multilingual model is required when non-English languages are specified. Overriding multilingual:false.")
-            effectiveMultilingual = true
+        var iterationConstraint = constraint
+        if !isEnglishOnlyRequest && !constraint.isMultilingual {
+            Logging.info("Multilingual model is required when non-English languages are specified. Overriding isMultilingual:false.")
+            iterationConstraint = constraint.asMultilingual
         }
         
         var allLanguageModels: [Set<String>] = []
-        
+        let effectiveConstraint = iterationConstraint
+
         for language in languages {
-            // Pass the possibly adjusted `effectiveMultilingual` flag down.
-            let supportForLanguage = recommendedModels(forLanguage: language, device: deviceName, multilingual: effectiveMultilingual)
+            // Pass the possibly adjusted `effectiveMultilingual` flag down via effectiveConstraint.
+            let supportForLanguage = recommendedModels(forLanguage: language, device: deviceName, constraint: effectiveConstraint)
             allLanguageModels.append(Set(supportForLanguage))
         }
         
@@ -388,9 +406,9 @@ public class ModelRepo {
     }
     
     /// Returns the list of recommended models for a language that are already downloaded
-    public func recommendedModelsAvailableLocally(forLanguage language: String, device deviceName: String? = nil, multilingual: Bool = true) throws -> [String] {
+    public func recommendedModelsAvailableLocally(forLanguage language: String, device deviceName: String? = nil, constraint: ModelConstraint = ModelConstraint()) throws -> [String] {
         let local = try localModels()
-        let recommended = recommendedModels(forLanguage: language, device: deviceName, multilingual: multilingual)
+        let recommended = recommendedModels(forLanguage: language, device: deviceName, constraint: constraint)
         return recommended.filter { local.contains($0) }
     }
     
@@ -399,12 +417,11 @@ public class ModelRepo {
     /// - Parameters:
     ///   - languages: Array of language codes to find models for. Models must support ALL languages.
     ///   - deviceName: The device identifier to get model support for. Pass nil to use the current device.
-    ///   - multilingual: If true (default), prefers multilingual models. If false and languages is only English,
-    ///                   prefers English-specific (.en) models. Ignored if non-English languages are present.
+    ///   - constraint: The constraints to apply for model selection.
     /// - Returns: Array of downloaded models that support all the specified languages
-    public func recommendedModelsAvailableLocally(forLanguages languages: [String], device deviceName: String? = nil, multilingual: Bool = true) throws -> [String] {
+    public func recommendedModelsAvailableLocally(forLanguages languages: [String], device deviceName: String? = nil, constraint: ModelConstraint = ModelConstraint()) throws -> [String] {
         let local = try localModels()
-        let recommended = recommendedModels(forLanguages: languages, device: deviceName, multilingual: multilingual)
+        let recommended = recommendedModels(forLanguages: languages, device: deviceName, constraint: constraint)
         return recommended.filter { local.contains($0) }
     }
     
@@ -674,21 +691,20 @@ public class ModelRepo {
     private func determineTargetModel(
         recommended: [String],
         downloaded: [String],
-        minimumSize: ModelSize,
-        multilingualRequired: Bool,
+        constraint: ModelConstraint,
         defaultModel: String
     ) -> String {
         var candidates = recommended
 
         // 1. Filter by multilingual requirement
-        if multilingualRequired {
+        if constraint.isMultilingual {
             candidates = candidates.filter { !$0.contains(".en") }
         }
         // If not multilingualRequired, we accept both .en and multilingual models from the `recommended` list.
         // The `recommendedModels(forLanguage:"en")` method should provide a list suitable for English.
 
         // 2. Filter by minimum size
-        candidates = candidates.filter { modelNameSatisfiesMinimumSize($0, minSize: minimumSize) }
+        candidates = candidates.filter { modelNameSatisfiesMinimumSize($0, minSize: constraint.minimumSize) }
 
         // 3. If no candidates meet criteria, fall back to defaultModel immediately.
         //    (Ideally, defaultModel should also be checked, but current logic is to provide it as a last resort)
@@ -733,30 +749,22 @@ public class ModelRepo {
     /// Downloads the best model for the specified languages if needed and returns its name.
     /// - Parameters:
     ///   - languages: Array of language codes to support
-    ///   - minimumSize: Optional minimum model size. Defaults to .base.
-    ///   - multilingual: If true (default), a multilingual model is preferred/required. 
-    ///                   If false, an English-only model may be considered if appropriate for the given languages.
+    ///   - constraint: Model constraints for size and multilingual capability. Defaults to .base, multilingual.
     ///   - progressCallback: Optional callback to track download progress
     /// - Returns: The name of the downloaded or existing model
     public func downloadedModel(
         forLanguages languages: [String],
-        minimumSize: ModelSize = .base,
-        multilingual: Bool = true,
+        constraint: ModelConstraint = ModelConstraint(),
         progressCallback: ((Progress) -> Void)? = nil
     ) async throws -> String {
-        // recommendations will be filtered by language context first by recommendedModels(forLanguages: languages)
-        let recommendedForLang = recommendedModels(forLanguages: languages, multilingual: multilingual)
-        let downloadedForLang = try recommendedModelsAvailableLocally(forLanguages: languages, multilingual: multilingual)
+        let recommendedForLang = recommendedModels(forLanguages: languages, constraint: constraint)
+        let downloadedForLang = try recommendedModelsAvailableLocally(forLanguages: languages, constraint: constraint)
         let deviceDefaultModel = modelSupport().default
 
-        // The `multilingual` parameter now directly dictates the multilingual requirement for determineTargetModel.
-        // If `multilingual` is false, determineTargetModel will allow .en models from the `recommendedForLang` list.
-        // If `multilingual` is true, determineTargetModel will filter out .en models from `recommendedForLang`.
         let targetModel = determineTargetModel(
             recommended: recommendedForLang,
             downloaded: downloadedForLang,
-            minimumSize: minimumSize,
-            multilingualRequired: multilingual, // Directly use the parameter
+            constraint: constraint, 
             defaultModel: deviceDefaultModel
         )
 
@@ -771,36 +779,30 @@ public class ModelRepo {
 
     /// Downloads the best model for the current device if needed and returns its name.
     /// - Parameters:
-    ///   - minimumSize: Optional minimum model size. Defaults to .base.
-    ///   - multilingual: If true (default), prefers/requires multilingual models. If false, prefers English-specific (.en) models.
+    ///   - constraint: Model constraints for size and multilingual capability. Defaults to .base, multilingual.
     ///   - progressCallback: Optional callback to track download progress
     /// - Returns: The name of the downloaded or existing model
     public func downloadedModel(
-        minimumSize: ModelSize = .base,
-        multilingual: Bool = true,
+        constraint: ModelConstraint = ModelConstraint(),
         progressCallback: ((Progress) -> Void)? = nil
     ) async throws -> String {
         let recommendedOverall: [String]
         let downloadedOverall: [String]
         let deviceDefaultModel = modelSupport().default
+        let englishFocusedConstraint = ModelConstraint(minimumSize: constraint.minimumSize, isMultilingual: false)
 
-        if !multilingual { // User specifically wants English-focused
-            recommendedOverall = recommendedModels(forLanguage: "en", multilingual: false) // Get recommendations tailored for English
-            downloadedOverall = try recommendedModelsAvailableLocally(forLanguage: "en", multilingual: false)
+        if !constraint.isMultilingual { // User specifically wants English-focused
+            recommendedOverall = recommendedModels(forLanguage: "en", constraint: englishFocusedConstraint)
+            downloadedOverall = try recommendedModelsAvailableLocally(forLanguage: "en", constraint: englishFocusedConstraint)
         } else {
             recommendedOverall = recommendedModels() // General recommendations for the device
             downloadedOverall = try recommendedModelsAvailableLocally()
         }
         
-        // The `multilingualRequired` for determineTargetModel is the same as the `multilingual` param here.
-        // If `multilingual` is true, we need a model that is not .en.
-        // If `multilingual` is false (meaning English-focused), `recommendedOverall` is already English-focused.
-        // In this case, `multilingualRequired` for `determineTargetModel` should be false to allow .en models from that list.
         let targetModel = determineTargetModel(
             recommended: recommendedOverall,
             downloaded: downloadedOverall,
-            minimumSize: minimumSize,
-            multilingualRequired: multilingual, // if true, filter out .en; if false, allow from the (already English-focused) list
+            constraint: constraint, 
             defaultModel: deviceDefaultModel
         )
 
