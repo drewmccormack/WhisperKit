@@ -18,31 +18,86 @@ public enum ModelSize: String, CaseIterable, Comparable {
         }
     }
 
+    /// Initializes a ModelSize from a model name string.
+    /// - Parameter modelName: The name of the model (e.g., "openai_whisper-tiny.en", "openai_whisper-large")
+    /// - Returns: The corresponding ModelSize, or nil if no size can be determined
+    public init?(modelName: String) {
+        for sizeCase in ModelSize.allCases.reversed() { // Check from largest to smallest to catch "large-v3" as "large"
+            if modelName.lowercased().contains(sizeCase.rawValue) {
+                self = sizeCase
+                return
+            }
+        }
+        return nil
+    }
+
     public static func < (lhs: ModelSize, rhs: ModelSize) -> Bool {
         return lhs.sortOrder < rhs.sortOrder
     }
 }
 
+/// Represents a range of model sizes, with minimum and maximum bounds.
+public struct ModelSizeRange {
+    public let minimumSize: ModelSize
+    public let maximumSize: ModelSize
+    
+    public init(minimumSize: ModelSize = .base, maximumSize: ModelSize = .large) {
+        self.minimumSize = minimumSize
+        self.maximumSize = maximumSize
+    }
+    
+    /// Returns a new range that satisfies both this range and the other.
+    public func combined(with other: ModelSizeRange) -> ModelSizeRange {
+        let newMinimumSize = max(self.minimumSize, other.minimumSize)
+        let newMaximumSize = min(self.maximumSize, other.maximumSize)
+        return ModelSizeRange(minimumSize: newMinimumSize, maximumSize: newMaximumSize)
+    }
+
+    /// Checks if a given model size falls within this range.
+    /// - Parameter size: The model size to check
+    /// - Returns: True if the size is within the range (inclusive of bounds), false otherwise
+    public func contains(_ size: ModelSize) -> Bool {
+        return size >= minimumSize && size <= maximumSize
+    }
+
+    /// Checks if a model name's size falls within this range.
+    /// - Parameter modelName: The name of the model to check
+    /// - Returns: True if the model's size is within the range, false otherwise
+    public func contains(modelName: String) -> Bool {
+        guard let size = ModelSize(modelName: modelName) else {
+            return false
+        }
+        return contains(size)
+    }
+}
+
 /// Encapsulates constraints for model selection.
 public struct ModelConstraint {
-    public var minimumSize: ModelSize
+    public var sizeRange: ModelSizeRange
     public var isMultilingual: Bool
 
-    public init(minimumSize: ModelSize = .base, isMultilingual: Bool = true) {
-        self.minimumSize = minimumSize
+    public init(sizeRange: ModelSizeRange = ModelSizeRange(), isMultilingual: Bool = true) {
+        self.sizeRange = sizeRange
+        self.isMultilingual = isMultilingual
+    }
+    
+    /// Convenience initializer that takes minimumSize and maximumSize directly
+    public init(minimumSize: ModelSize = .base, isMultilingual: Bool = true, maximumSize: ModelSize = .large) {
+        self.sizeRange = ModelSizeRange(minimumSize: minimumSize, maximumSize: maximumSize)
         self.isMultilingual = isMultilingual
     }
 
     /// Returns a new constraint that satisfies both this constraint and the other.
     public func combined(with other: ModelConstraint) -> ModelConstraint {
-        let newMinimumSize = max(self.minimumSize, other.minimumSize)
-        let newIsMultilingual = self.isMultilingual || other.isMultilingual
-        return ModelConstraint(minimumSize: newMinimumSize, isMultilingual: newIsMultilingual)
+        return ModelConstraint(
+            sizeRange: self.sizeRange.combined(with: other.sizeRange),
+            isMultilingual: self.isMultilingual || other.isMultilingual
+        )
     }
 
     /// Returns a new constraint, ensuring it is multilingual.
     public var asMultilingual: ModelConstraint {
-        return ModelConstraint(minimumSize: self.minimumSize, isMultilingual: true)
+        return ModelConstraint(sizeRange: self.sizeRange, isMultilingual: true)
     }
 }
 
@@ -671,12 +726,7 @@ public class ModelRepo {
     
     /// Extracts the base ModelSize from a model name string.
     private func getModelSizeFromName(_ modelName: String) -> ModelSize? {
-        for sizeCase in ModelSize.allCases.reversed() { // Check from largest to smallest to catch "large-v3" as "large"
-            if modelName.lowercased().contains(sizeCase.rawValue) {
-                return sizeCase
-            }
-        }
-        return nil
+        return ModelSize(modelName: modelName)
     }
 
     /// Checks if a model name meets or exceeds a minimum size requirement.
@@ -685,6 +735,14 @@ public class ModelRepo {
             return false // Cannot determine size from name
         }
         return modelSize >= minSize
+    }
+
+    /// Checks if a model name is within a maximum size requirement.
+    private func modelNameSatisfiesMaximumSize(_ modelName: String, maxSize: ModelSize) -> Bool {
+        guard let modelSize = getModelSizeFromName(modelName) else {
+            return true // Cannot determine size from name, so can't enforce max; effectively passes
+        }
+        return modelSize <= maxSize
     }
 
     /// Determines the target model name based on recommended/downloaded lists and other criteria.
@@ -703,13 +761,13 @@ public class ModelRepo {
         // If not multilingualRequired, we accept both .en and multilingual models from the `recommended` list.
         // The `recommendedModels(forLanguage:"en")` method should provide a list suitable for English.
 
-        // 2. Filter by minimum size
-        candidates = candidates.filter { modelNameSatisfiesMinimumSize($0, minSize: constraint.minimumSize) }
+        // 2. Filter by size range
+        candidates = candidates.filter { constraint.sizeRange.contains(modelName: $0) }
 
         // 3. If no candidates meet criteria, fall back to defaultModel immediately.
         //    (Ideally, defaultModel should also be checked, but current logic is to provide it as a last resort)
         if candidates.isEmpty {
-            Logging.debug("No models in the recommended list satisfy the multilingual and minimum size criteria. Falling back to default model: \(defaultModel)")
+            Logging.debug("No models in the recommended list satisfy the multilingual and size range criteria. Falling back to default model: \(defaultModel)")
             return defaultModel
         }
 
@@ -789,7 +847,8 @@ public class ModelRepo {
         let recommendedOverall: [String]
         let downloadedOverall: [String]
         let deviceDefaultModel = modelSupport().default
-        let englishFocusedConstraint = ModelConstraint(minimumSize: constraint.minimumSize, isMultilingual: false)
+        // Preserve maximumSize from original constraint when creating englishFocusedConstraint
+        let englishFocusedConstraint = ModelConstraint(sizeRange: ModelSizeRange(minimumSize: constraint.sizeRange.minimumSize, maximumSize: constraint.sizeRange.maximumSize), isMultilingual: false)
 
         if !constraint.isMultilingual { // User specifically wants English-focused
             recommendedOverall = recommendedModels(forLanguage: "en", constraint: englishFocusedConstraint)
