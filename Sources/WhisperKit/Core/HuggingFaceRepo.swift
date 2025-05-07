@@ -22,7 +22,7 @@ public class HuggingFaceRepo: Codable, Equatable, Hashable {
     /// The authentication token for the repository. Can be nil for public repos
     public var token: String?
     
-    /// The base URL for downloading from the repository
+    /// The base URL for downloading from the repository. If nil, HubApi will use its default.
     public let downloadBase: URL?
     
     /// The full repository identifier in the format "owner/repository"
@@ -67,16 +67,17 @@ public class HuggingFaceRepo: Codable, Equatable, Hashable {
     
     // MARK: - API Methods
     
-    /// Fetches the model support configuration from the repository
-    /// This method always returns a ModelSupportConfig, using a fallback if the fetch fails
+    /// Fetches the model support configuration from the repository.
+    /// This method always returns a ModelSupportConfig, using a fallback if the fetch fails.
     public func fetchModelSupportConfig() async throws -> ModelSupportConfig {
         let hubApi = HubApi(downloadBase: downloadBase, hfToken: token)
         var modelSupportConfig = Constants.fallbackModelSupportConfig
         
         do {
-            let configUrl = try await hubApi.snapshot(from: identifier, matching: "config*")
+            // HubApi.snapshot downloads the config.json to its cache and returns the repo root in that cache.
+            let downloadedRepoRootInCache = try await hubApi.snapshot(from: identifier, matching: "config*")
             let decoder = JSONDecoder()
-            let jsonData = try Data(contentsOf: configUrl.appendingPathComponent("config.json"))
+            let jsonData = try Data(contentsOf: downloadedRepoRootInCache.appendingPathComponent("config.json"))
             modelSupportConfig = try decoder.decode(ModelSupportConfig.self, from: jsonData)
         } catch {
             Logging.error("Error fetching model support config, using fallback: \(error)")
@@ -85,57 +86,58 @@ public class HuggingFaceRepo: Codable, Equatable, Hashable {
         return modelSupportConfig
     }
     
-    /// Downloads model files, populating the specified base download location.
+    /// Downloads all files for a given model variant (matching `*modelName/*`) into a specified base location.
     /// 
-    /// The `HubApi` used internally downloads files directly into a structure within the 
-    /// `effectiveApiDownloadBase`. If this base is a temporary location (as orchestrated by a caller like `ModelRepo`), 
-    /// the caller is then responsible for atomically moving the resulting model variant folder 
-    /// to its final persistent repository to ensure integrity.
+    /// The `HubApi` used internally downloads files directly into a structured path within the `effectiveApiDownloadBase`.
+    /// For example, if `effectiveApiDownloadBase` is `~/Temp/Downloads`, `repo.type` is `.models`,
+    /// `repo.id` is `owner/repoName`, and `model` is `modelVariant`, files will be placed in
+    /// `~/Temp/Downloads/models/owner/repoName/modelVariant/`.
+    /// 
+    /// This method returns the path to the `modelVariant` folder within the `effectiveApiDownloadBase` structure.
+    /// If `effectiveApiDownloadBase` is intended as a temporary location (e.g., by `ModelRepo`), the caller is responsible
+    /// for moving the returned model variant folder to a final persistent repository.
     ///
     /// - Parameters:
-    ///   - model: The model name to download (used to construct glob pattern)
-    ///   - useBackgroundSession: Whether to use a background download session
-    ///   - progressCallback: Optional callback for download progress
-    ///   - downloadToBase: Optional URL to use as the base for HubApi downloads. If nil, uses self.downloadBase (which itself might be nil, causing HubApi to use its default).
-    /// - Returns: URL to the temporary folder containing the downloaded model variant files.
+    ///   - model: The model variant name (e.g., "openai_whisper-base") used to construct the glob pattern `*modelName/*` for HubApi.
+    ///   - useBackgroundSession: Whether to use a background download session.
+    ///   - progressCallback: Optional callback for download progress.
+    ///   - downloadToBase: Optional URL to use as the root for `HubApi` downloads. If nil, `self.downloadBase` is used.
+    ///                     If both are nil, `HubApi` uses its own default (typically `Documents/huggingface`).
+    /// - Returns: URL to the folder containing the downloaded model variant files within the `effectiveApiDownloadBase` structure.
     public func downloadModelFiles(
         model: String,
         useBackgroundSession: Bool = false,
         progressCallback: ((Progress) -> Void)? = nil,
         downloadToBase: URL? = nil
     ) async throws -> URL {
-        // Determine the download base for HubApi for this specific operation.
-        // If `downloadToBase` is provided, it overrides `self.downloadBase` for this call.
-        // If both are nil, HubApi will use its own default (typically .../Documents/huggingface).
         let effectiveApiDownloadBase = downloadToBase ?? self.downloadBase
 
         let hubApi = HubApi(
-            downloadBase: effectiveApiDownloadBase, // Use the determined base
+            downloadBase: effectiveApiDownloadBase,
             hfToken: self.token,
-            endpoint: "https://huggingface.co", // Explicitly set endpoint
+            endpoint: "https://huggingface.co", 
             useBackgroundSession: useBackgroundSession
         )
 
         let repo = Hub.Repo(id: identifier)
         
-        // HubApi.snapshot will download files matching "*\(model)/*" 
-        // into a structure like: effectiveApiDownloadBase/repo.type/repo.id/model/file.txt
-        // It returns the path: effectiveApiDownloadBase/repo.type/repo.id
+        // HubApi.snapshot downloads files matching "*\(model)/*" 
+        // into: effectiveApiDownloadBase/repo.type/repo.id/ (then files go into model-specific subdirs)
+        // It returns the path: effectiveApiDownloadBase/repo.type/repo.id/
         let downloadedRepoRoot = try await hubApi.snapshot(from: repo, matching: ["*\(model)/*"]) { progress in
             progressCallback?(progress)
         }
-
-        // The actual model variant files are inside a subdirectory named `model` (the variant name)
+        
+        // The actual model variant files are in a subdirectory named `model` (the variant name)
         // within this `downloadedRepoRoot`.
         let modelVariantPathInEffectiveBase = downloadedRepoRoot.appendingPathComponent(model)
 
-        // Verify the model variant path exists after download
         var isDirectory: ObjCBool = false
         if !FileManager.default.fileExists(atPath: modelVariantPathInEffectiveBase.path, isDirectory: &isDirectory) || !isDirectory.boolValue {
             let baseDesc = effectiveApiDownloadBase?.path ?? "HubApi default (Documents/huggingface)"
             throw WhisperError.modelsUnavailable("Model variant '\(model)' not found at expected path '\(modelVariantPathInEffectiveBase.path)' after download attempt using base '\(baseDesc)'.")
         }
         
-        return modelVariantPathInEffectiveBase // Return the path to the actual model variant directory
+        return modelVariantPathInEffectiveBase
     }
 } 

@@ -3,8 +3,28 @@
 
 import Foundation
 
+/// Represents the different sizes of Whisper models, without language or version specifics.
+public enum ModelSize: String, CaseIterable, Comparable {
+    case tiny, base, small, medium, large
+
+    /// Provides an ordering for model sizes, smallest to largest.
+    private var sortOrder: Int {
+        switch self {
+        case .tiny: return 0
+        case .base: return 1
+        case .small: return 2
+        case .medium: return 3
+        case .large: return 4
+        }
+    }
+
+    public static func < (lhs: ModelSize, rhs: ModelSize) -> Bool {
+        return lhs.sortOrder < rhs.sortOrder
+    }
+}
+
 /// Represents the state of the remote model support configuration loading process.
-public enum RemoteConfigState: Equatable {
+internal enum RemoteConfigState: Equatable {
     /// The remote configuration is currently being fetched.
     case loading
     /// The remote configuration was successfully loaded.
@@ -12,7 +32,6 @@ public enum RemoteConfigState: Equatable {
     /// Fetching the remote configuration failed with an error.
     case failed(Error)
 
-    // Custom Equatable conformance to handle the associated Error value
     public static func == (lhs: RemoteConfigState, rhs: RemoteConfigState) -> Bool {
         switch (lhs, rhs) {
         case (.loading, .loading):
@@ -20,7 +39,6 @@ public enum RemoteConfigState: Equatable {
         case (.loaded, .loaded):
             return true
         case (.failed, .failed):
-            // Consider two .failed states equal regardless of the specific error
             return true
         default:
             return false
@@ -50,10 +68,10 @@ public class ModelRepo {
     /// Indicates whether the remote configuration has been loaded
     public private(set) var isRemoteConfigLoaded: Bool = false
     
-    /// The state of the remote configuration loading process
-    public private(set) var remoteConfigState: RemoteConfigState = .loading
+    /// The detailed state of the remote configuration loading process (internal use)
+    private var remoteConfigState: RemoteConfigState = .loading
     
-    /// The configuration for model support - starts with fallback and updates when remote config loads
+    /// The configuration for model support - starts with fallback and updates when remote config downloads
     public private(set) var modelSupportConfig: ModelSupportConfig
     
     /// Task that handles the async loading of the remote configuration
@@ -165,30 +183,23 @@ public class ModelRepo {
     }
     
     /// Returns the recommended models for a specific language, taking into account
-    /// language complexity and resource requirements
+    /// language complexity, resource requirements, and multilingual preference.
     ///
     /// - Parameters:
-    ///   - language: The language code to find models for. Accepts both simple ISO 639 codes
-    ///     (e.g., "en", "zh", "pt") and BCP-47 locale-specific codes (e.g., "en-US", "zh-Hant", "pt-PT").
-    ///     For locale-specific codes, only the primary language part is used for determining support.
-    ///   - deviceName: The device identifier to get model support for.
-    ///     Pass nil to use the current device.
-    ///
-    /// - Returns: An array of model names ordered by preference, with the default model first
-    ///   (if available) followed by models ordered from smallest to largest.
-    public func recommendedModels(forLanguage language: String, device deviceName: String? = nil) -> [String] {
-        // Language categories by resource requirements and script complexity
+    ///   - language: The language code to find models for.
+    ///   - deviceName: The device identifier. Pass nil for the current device.
+    ///   - multilingual: If true (default), prefers multilingual models. If false and language is English,
+    ///                   prefers English-specific (.en) models if available.
+    /// - Returns: An array of model names ordered by preference.
+    public func recommendedModels(forLanguage language: String, device deviceName: String? = nil, multilingual: Bool = true) -> [String] {
         let englishOnly = ["en", "english"]
         let wellResourcedEuropean = ["es", "fr", "de", "it", "pt", "nl", "pl", "ro", "ca", "sv", "no", "da"]
         let mediumResourced = ["ru", "uk", "cs", "fi", "hu", "el", "tr", "bg", "sr", "hr", "sl"]
         let complexScriptOrTonal = ["zh", "ja", "ko", "ar", "hi", "th", "vi", "fa", "he", "ur"]
         
-        // Get available models for the specified device
         let currentSupport = deviceName != nil ? modelSupport(for: deviceName!) : modelSupport()
         let availableModels = currentSupport.supported
         
-        // Extract primary language code if a locale-specific code is provided
-        // e.g., "pt-PT" -> "pt", "zh-Hant" -> "zh"
         let inputLanguage = language.lowercased()
         let primaryLanguageCode: String
         
@@ -198,52 +209,55 @@ public class ModelRepo {
             primaryLanguageCode = inputLanguage
         }
         
-        // Filter models - first based on whether it's an English-only request
         var filteredModels: [String]
-        
-        if englishOnly.contains(primaryLanguageCode) {
-            // For English, include both multilingual and English-specific models
-            filteredModels = availableModels.filter { model in
-                // Include all English-specific models and multilingual models
-                // Exclude .{other-language} models if they exist
-                !model.contains(".") || model.contains(".en")
+        let isEnglish = englishOnly.contains(primaryLanguageCode)
+
+        if isEnglish {
+            if !multilingual {
+                let englishSpecificModels = availableModels.filter { $0.contains(".en") }
+                if !englishSpecificModels.isEmpty {
+                    filteredModels = englishSpecificModels
+                    Logging.debug("Recommending English-specific models for 'en' due to multilingual:false preference.")
+                } else {
+                    filteredModels = availableModels.filter { !$0.contains(".") || $0.contains(".en") }
+                    Logging.debug("No English-specific (.en) models found for 'en' with multilingual:false. Falling back to general English-compatible models.")
+                }
+            } else {
+                filteredModels = availableModels.filter { !$0.contains(".") || $0.contains(".en") }
             }
         } else {
-            // For non-English, we need multilingual models only (no .en models)
-            filteredModels = availableModels.filter { model in
-                // Include only multilingual models (those without .en)
-                !model.contains(".en")
+            if !multilingual {
+                Logging.info("Multilingual model is required for language '\(primaryLanguageCode)'. Ignoring multilingual:false preference. Consider providing multilingual:true.")
             }
-            
-            // Further filter based on language complexity requirements
-            if complexScriptOrTonal.contains(primaryLanguageCode) {
-                // Complex scripts need at least small models, preferably large
-                filteredModels = filteredModels.filter { model in
-                    !model.contains("tiny") && (!model.contains("base") || model.contains("large"))
-                }
-            } else if mediumResourced.contains(primaryLanguageCode) {
-                // Medium-resourced languages should avoid tiny models
-                filteredModels = filteredModels.filter { model in
-                    !model.contains("tiny")
-                }
-            } else if !wellResourcedEuropean.contains(primaryLanguageCode) {
-                // Unknown or low-resourced languages need at least small models, similar to complex scripts
-                filteredModels = filteredModels.filter { model in
-                    !model.contains("tiny") && (!model.contains("base") || model.contains("large"))
-                }
-            }
-        }
-        
-        // If no models passed our filters, return all multilingual models as fallback
-        if filteredModels.isEmpty {
             filteredModels = availableModels.filter { !$0.contains(".en") }
         }
         
-        // Only include the default model if it's in our filtered list
+        if complexScriptOrTonal.contains(primaryLanguageCode) {
+            filteredModels = filteredModels.filter {
+                !$0.contains("tiny") && (!$0.contains("base") || $0.contains("large"))
+            }
+        } else if mediumResourced.contains(primaryLanguageCode) {
+            filteredModels = filteredModels.filter {
+                !$0.contains("tiny")
+            }
+        } else if !wellResourcedEuropean.contains(primaryLanguageCode) && !isEnglish {
+            filteredModels = filteredModels.filter {
+                !$0.contains("tiny") && (!$0.contains("base") || $0.contains("large"))
+            }
+        }
+        
+        if filteredModels.isEmpty {
+            if isEnglish {
+                filteredModels = availableModels.filter { !$0.contains(".") || $0.contains(".en") }
+            } else {
+                filteredModels = availableModels.filter { !$0.contains(".en") }
+            }
+            Logging.debug("Initial filtering led to empty list for lang '\(primaryLanguageCode)'. Reverted to broader language-appropriate list: \(filteredModels.count) models.")
+        }
+        
         let defaultModel = currentSupport.default
         let includeDefault = filteredModels.contains(defaultModel)
         
-        // Order the filtered models by preference
         return orderModelsByPreference(support: ModelSupport(
             default: includeDefault ? defaultModel : filteredModels.first ?? defaultModel,
             supported: filteredModels
@@ -258,25 +272,37 @@ public class ModelRepo {
     ///     (e.g., "en", "zh", "pt") and BCP-47 locale-specific codes (e.g., "en-US", "zh-Hant", "pt-PT").
     ///   - deviceName: The device identifier to get model support for.
     ///     Pass nil to use the current device.
-    ///
+    ///   - multilingual: If true (default), prefers multilingual models. If false and languages is only English,
+    ///                   prefers English-specific (.en) models. Ignored if non-English languages are present.
     /// - Returns: An array of model names ordered by preference, with the default model first
     ///   (if available) followed by models ordered from smallest to largest.
-    public func recommendedModels(forLanguages languages: [String], device deviceName: String? = nil) -> [String] {
-        // Handle empty languages array
+    public func recommendedModels(forLanguages languages: [String], device deviceName: String? = nil, multilingual: Bool = true) -> [String] {
         if languages.isEmpty {
-            return recommendedModels(device: deviceName)
+            if multilingual {
+                return recommendedModels(device: deviceName)
+            } else {
+                // If no languages are specified but multilingual is false, assume English-focused models are desired.
+                return recommendedModels(forLanguage: "en", device: deviceName, multilingual: false)
+            }
         }
         
-        // Handle single language case
-        if languages.count == 1, let language = languages.first {
-            return recommendedModels(forLanguage: language, device: deviceName)
+        let isEnglishOnlyRequest = languages.allSatisfy { ["en", "english"].contains($0.lowercased()) }
+
+        if !multilingual && languages.count == 1 && isEnglishOnlyRequest {
+            return recommendedModels(forLanguage: languages.first!, device: deviceName, multilingual: false)
+        }
+
+        var effectiveMultilingual = multilingual
+        if !multilingual && !isEnglishOnlyRequest {
+            Logging.info("Multilingual model is required when non-English languages are specified. Overriding multilingual:false.")
+            effectiveMultilingual = true
         }
         
-        // Get supported models for each language
         var allLanguageModels: [Set<String>] = []
         
         for language in languages {
-            let supportForLanguage = recommendedModels(forLanguage: language, device: deviceName)
+            // Pass the possibly adjusted `effectiveMultilingual` flag down.
+            let supportForLanguage = recommendedModels(forLanguage: language, device: deviceName, multilingual: effectiveMultilingual)
             allLanguageModels.append(Set(supportForLanguage))
         }
         
@@ -355,16 +381,16 @@ public class ModelRepo {
     }
     
     /// Returns the list of recommended models that are already downloaded
-    public func downloadedRecommendedModels() throws -> [String] {
+    public func recommendedModelsAvailableLocally() throws -> [String] {
         let local = try localModels()
         let recommended = recommendedModels()
         return recommended.filter { local.contains($0) }
     }
     
     /// Returns the list of recommended models for a language that are already downloaded
-    public func downloadedRecommendedModels(forLanguage language: String, device deviceName: String? = nil) throws -> [String] {
+    public func recommendedModelsAvailableLocally(forLanguage language: String, device deviceName: String? = nil, multilingual: Bool = true) throws -> [String] {
         let local = try localModels()
-        let recommended = recommendedModels(forLanguage: language, device: deviceName)
+        let recommended = recommendedModels(forLanguage: language, device: deviceName, multilingual: multilingual)
         return recommended.filter { local.contains($0) }
     }
     
@@ -373,10 +399,12 @@ public class ModelRepo {
     /// - Parameters:
     ///   - languages: Array of language codes to find models for. Models must support ALL languages.
     ///   - deviceName: The device identifier to get model support for. Pass nil to use the current device.
+    ///   - multilingual: If true (default), prefers multilingual models. If false and languages is only English,
+    ///                   prefers English-specific (.en) models. Ignored if non-English languages are present.
     /// - Returns: Array of downloaded models that support all the specified languages
-    public func downloadedRecommendedModels(forLanguages languages: [String], device deviceName: String? = nil) throws -> [String] {
+    public func recommendedModelsAvailableLocally(forLanguages languages: [String], device deviceName: String? = nil, multilingual: Bool = true) throws -> [String] {
         let local = try localModels()
-        let recommended = recommendedModels(forLanguages: languages, device: deviceName)
+        let recommended = recommendedModels(forLanguages: languages, device: deviceName, multilingual: multilingual)
         return recommended.filter { local.contains($0) }
     }
     
@@ -438,6 +466,10 @@ public class ModelRepo {
     ///
     /// This method is specifically for seeding models into the Hugging Face model directory
     /// structure. It will place the model in the standard location: huggingface/models/argmaxinc/whisperkit-coreml
+    /// 
+    /// This method is useful when you ship a model with your app and want to make it available.
+    /// With a model shipped in the app bundle, you are guaranteed to have the model available
+    /// when the app is installed.
     ///
     /// - Parameters:
     ///   - sourceURL: The file URL pointing to the directory containing the model files to import.
@@ -620,62 +652,118 @@ public class ModelRepo {
     
     // MARK: - Convenience Download Methods
     
-    /// Determines the target model name based on recommended/downloaded lists and optional size preference.
-    private func determineTargetModel(recommended: [String], downloaded: [String], preferredSize: String?, defaultModel: String) -> String {
-        // 1. Handle preferred size
-        if let preferred = preferredSize {
-            // Check if preferred size is downloaded
-            if let model = downloaded.first(where: { $0.contains(preferred) }) {
-                return model // Use downloaded preferred size
+    /// Extracts the base ModelSize from a model name string.
+    private func getModelSizeFromName(_ modelName: String) -> ModelSize? {
+        for sizeCase in ModelSize.allCases.reversed() { // Check from largest to smallest to catch "large-v3" as "large"
+            if modelName.lowercased().contains(sizeCase.rawValue) {
+                return sizeCase
             }
-            // Check if preferred size is recommended
-            if let model = recommended.first(where: { $0.contains(preferred) }) {
-                return model // Use recommended preferred size (will need download check later)
-            }
-            // Preferred size not found or not recommended, fall back.
-            Logging.debug("Preferred size '\\(preferred)' not found in recommended models. Falling back.")
-            // Fall through to logic below (use first downloaded, or first recommended)
+        }
+        return nil
+    }
+
+    /// Checks if a model name meets or exceeds a minimum size requirement.
+    private func modelNameSatisfiesMinimumSize(_ modelName: String, minSize: ModelSize) -> Bool {
+        guard let modelSize = getModelSizeFromName(modelName) else {
+            return false // Cannot determine size from name
+        }
+        return modelSize >= minSize
+    }
+
+    /// Determines the target model name based on recommended/downloaded lists and other criteria.
+    private func determineTargetModel(
+        recommended: [String],
+        downloaded: [String],
+        minimumSize: ModelSize,
+        multilingualRequired: Bool,
+        defaultModel: String
+    ) -> String {
+        var candidates = recommended
+
+        // 1. Filter by multilingual requirement
+        if multilingualRequired {
+            candidates = candidates.filter { !$0.contains(".en") }
+        }
+        // If not multilingualRequired, we accept both .en and multilingual models from the `recommended` list.
+        // The `recommendedModels(forLanguage:"en")` method should provide a list suitable for English.
+
+        // 2. Filter by minimum size
+        candidates = candidates.filter { modelNameSatisfiesMinimumSize($0, minSize: minimumSize) }
+
+        // 3. If no candidates meet criteria, fall back to defaultModel immediately.
+        //    (Ideally, defaultModel should also be checked, but current logic is to provide it as a last resort)
+        if candidates.isEmpty {
+            Logging.debug("No models in the recommended list satisfy the multilingual and minimum size criteria. Falling back to default model: \(defaultModel)")
+            return defaultModel
         }
 
-        // 2. No preferred size OR preferred size fallback - use first downloaded if available
-        if let model = downloaded.first {
-            return model
+        // 4. Prioritize downloaded models that meet criteria
+        let downloadedCandidates = candidates.filter { downloaded.contains($0) }
+        
+        let modelsToConsiderForOrdering: [String]
+        if !downloadedCandidates.isEmpty {
+            modelsToConsiderForOrdering = downloadedCandidates
+            Logging.debug("Found downloaded models satisfying criteria: \(modelsToConsiderForOrdering)")
+        } else {
+            modelsToConsiderForOrdering = candidates
+            Logging.debug("No downloaded models satisfy criteria. Considering recommended models for download: \(modelsToConsiderForOrdering)")
         }
+        
+        // 5. Order the chosen set of models and pick the best one.
+        // The `defaultModel` passed here is a hint for ordering if it's part of modelsToConsiderForOrdering.
+        // If not, the first of the sorted list will be a good primary candidate.
+        let effectiveDefaultForOrdering = modelsToConsiderForOrdering.contains(defaultModel) ? defaultModel : modelsToConsiderForOrdering.first ?? defaultModel
+        
+        let orderedModels = orderModelsByPreference(support: ModelSupport(
+            default: effectiveDefaultForOrdering, 
+            supported: modelsToConsiderForOrdering
+        ))
 
-        // 3. No preferred size/fallback, none downloaded - use first recommended or device default
-        return recommended.first ?? defaultModel
+        if let bestChoice = orderedModels.first {
+            Logging.debug("Best choice after ordering: \(bestChoice)")
+            return bestChoice
+        } else {
+            // This case should ideally not be reached if candidates was not empty.
+            // But as a final fallback if ordering somehow results in an empty list.
+            Logging.debug("Ordering resulted in no best choice. Falling back to default model: \(defaultModel)")
+            return defaultModel
+        }
     }
 
     /// Downloads the best model for the specified languages if needed and returns its name.
     /// - Parameters:
     ///   - languages: Array of language codes to support
-    ///   - preferredSize: Optional preferred model size. If specified, will try to use a model of this size.
+    ///   - minimumSize: Optional minimum model size. Defaults to .base.
+    ///   - multilingual: If true (default), a multilingual model is preferred/required. 
+    ///                   If false, an English-only model may be considered if appropriate for the given languages.
     ///   - progressCallback: Optional callback to track download progress
     /// - Returns: The name of the downloaded or existing model
     public func downloadedModel(
         forLanguages languages: [String],
-        preferredSize: String? = nil,
+        minimumSize: ModelSize = .base,
+        multilingual: Bool = true,
         progressCallback: ((Progress) -> Void)? = nil
     ) async throws -> String {
-        // Get recommended and downloaded models specific to the languages
-        let recommended = recommendedModels(forLanguages: languages)
-        let downloadedForLang = try downloadedRecommendedModels(forLanguages: languages)
-        let defaultModel = modelSupport().default // Use device default as ultimate fallback
+        // recommendations will be filtered by language context first by recommendedModels(forLanguages: languages)
+        let recommendedForLang = recommendedModels(forLanguages: languages, multilingual: multilingual)
+        let downloadedForLang = try recommendedModelsAvailableLocally(forLanguages: languages, multilingual: multilingual)
+        let deviceDefaultModel = modelSupport().default
 
-        // Determine the best model name to use
+        // The `multilingual` parameter now directly dictates the multilingual requirement for determineTargetModel.
+        // If `multilingual` is false, determineTargetModel will allow .en models from the `recommendedForLang` list.
+        // If `multilingual` is true, determineTargetModel will filter out .en models from `recommendedForLang`.
         let targetModel = determineTargetModel(
-            recommended: recommended,
+            recommended: recommendedForLang,
             downloaded: downloadedForLang,
-            preferredSize: preferredSize,
-            defaultModel: defaultModel
+            minimumSize: minimumSize,
+            multilingualRequired: multilingual, // Directly use the parameter
+            defaultModel: deviceDefaultModel
         )
 
-        // Check if the target model is already downloaded locally (check *all* local models)
         let allDownloaded = try localModels()
         if allDownloaded.contains(targetModel) {
             return targetModel
         } else {
-            // Download the target model if it's not already local
             _ = try await download(model: targetModel, progressCallback: progressCallback)
             return targetModel
         }
@@ -683,34 +771,50 @@ public class ModelRepo {
 
     /// Downloads the best model for the current device if needed and returns its name.
     /// - Parameters:
-    ///   - preferredSize: Optional preferred model size. If specified, will try to use a model of this size.
+    ///   - minimumSize: Optional minimum model size. Defaults to .base.
+    ///   - multilingual: If true (default), prefers/requires multilingual models. If false, prefers English-specific (.en) models.
     ///   - progressCallback: Optional callback to track download progress
     /// - Returns: The name of the downloaded or existing model
     public func downloadedModel(
-        preferredSize: String? = nil,
+        minimumSize: ModelSize = .base,
+        multilingual: Bool = true,
         progressCallback: ((Progress) -> Void)? = nil
     ) async throws -> String {
-        // Get recommended and downloaded models for the current device
-        let recommended = recommendedModels()
-        let downloaded = try downloadedRecommendedModels()
-        let defaultModel = modelSupport().default
+        let recommendedOverall: [String]
+        let downloadedOverall: [String]
+        let deviceDefaultModel = modelSupport().default
 
-        // Determine the best model name to use
+        if !multilingual { // User specifically wants English-focused
+            recommendedOverall = recommendedModels(forLanguage: "en", multilingual: false) // Get recommendations tailored for English
+            downloadedOverall = try recommendedModelsAvailableLocally(forLanguage: "en", multilingual: false)
+        } else {
+            recommendedOverall = recommendedModels() // General recommendations for the device
+            downloadedOverall = try recommendedModelsAvailableLocally()
+        }
+        
+        // The `multilingualRequired` for determineTargetModel is the same as the `multilingual` param here.
+        // If `multilingual` is true, we need a model that is not .en.
+        // If `multilingual` is false (meaning English-focused), `recommendedOverall` is already English-focused.
+        // In this case, `multilingualRequired` for `determineTargetModel` should be false to allow .en models from that list.
         let targetModel = determineTargetModel(
-            recommended: recommended,
-            downloaded: downloaded,
-            preferredSize: preferredSize,
-            defaultModel: defaultModel
+            recommended: recommendedOverall,
+            downloaded: downloadedOverall,
+            minimumSize: minimumSize,
+            multilingualRequired: multilingual, // if true, filter out .en; if false, allow from the (already English-focused) list
+            defaultModel: deviceDefaultModel
         )
 
-        // Check if the target model is already downloaded locally
-        if downloaded.contains(targetModel) {
-            return targetModel
-        } else {
-            // Download the target model if it's not already local
-            _ = try await download(model: targetModel, progressCallback: progressCallback)
-            return targetModel
+        if downloadedOverall.contains(targetModel) { // Check against the context-specific downloaded list
+            // It's possible targetModel is from the broader `recommendedOverall` but not in context-specific `downloadedOverall`
+            // A final check against all local models is safer.
+            let allLocal = try localModels()
+            if allLocal.contains(targetModel) {
+                 return targetModel
+            }
         }
+        // If not in context-specific downloaded list, or not in allLocal, then download.
+        _ = try await download(model: targetModel, progressCallback: progressCallback)
+        return targetModel
     }
 
     // MARK: - Model Formats
@@ -762,7 +866,7 @@ public class ModelRepo {
     /// Factory method to create a ModelRepo with a specific configuration - for testing only
     /// This allows tests to create a ModelRepo with a predefined configuration without network calls
     #if DEBUG
-    public static func forTesting(
+    internal static func forTesting(
         huggingFaceRepo: HuggingFaceRepo = .init(),
         localDirectory: URL? = nil,
         useBackgroundDownloadSession: Bool = false,
