@@ -80,12 +80,6 @@ public struct ModelConstraint {
         self.sizeRange = sizeRange
         self.isMultilingual = isMultilingual
     }
-    
-    /// Convenience initializer that takes minimumSize and maximumSize directly
-    public init(minimumSize: ModelSize = .base, isMultilingual: Bool = true, maximumSize: ModelSize = .large) {
-        self.sizeRange = ModelSizeRange(minimumSize: minimumSize, maximumSize: maximumSize)
-        self.isMultilingual = isMultilingual
-    }
 
     /// Returns a new constraint that satisfies both this constraint and the other.
     public func combined(with other: ModelConstraint) -> ModelConstraint {

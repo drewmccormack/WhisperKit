@@ -413,21 +413,21 @@ final class ModelRepoTests: XCTestCase {
 
     func testDownloadedModelForDevice_WithConstraints() async throws {
         // Test multilingual: false (English-only focus)
-        let enModelName = try await modelRepo.downloadedModel(constraint: ModelConstraint(minimumSize: .tiny, isMultilingual: false))
+        let enModelName = try await modelRepo.downloadedModel(constraint: ModelConstraint(sizeRange: ModelSizeRange(minimumSize: .tiny), isMultilingual: false))
         XCTAssertTrue(enModelName.contains(".en"), "Expected an English-only model")
         XCTAssertTrue(enModelName.contains("tiny")) // Since minSize is tiny
         XCTAssertTrue(mockHFRepo.downloadedModels.contains(enModelName))
         mockHFRepo.downloadedModels.removeAll() // Clear for next download
 
         // Test minimumSize: .small, maximumSize: .medium, multilingual: true
-        let smallMultiModel = try await modelRepo.downloadedModel(constraint: ModelConstraint(minimumSize: .small, isMultilingual: true, maximumSize: .medium))
+        let smallMultiModel = try await modelRepo.downloadedModel(constraint: ModelConstraint(sizeRange: ModelSizeRange(minimumSize: .small, maximumSize: .medium), isMultilingual: true))
         XCTAssertTrue(smallMultiModel.contains("small"))
         XCTAssertFalse(smallMultiModel.contains(".en")) // Default is base, small is also multilingual
         XCTAssertTrue(mockHFRepo.downloadedModels.contains(smallMultiModel))
         mockHFRepo.downloadedModels.removeAll()
 
         // Test minimumSize: .large, maximumSize: .large, multilingual: true
-        let largeMultiModel = try await modelRepo.downloadedModel(constraint: ModelConstraint(minimumSize: .large, isMultilingual: true, maximumSize: .large))
+        let largeMultiModel = try await modelRepo.downloadedModel(constraint: ModelConstraint(sizeRange: ModelSizeRange(minimumSize: .large, maximumSize: .large), isMultilingual: true))
         XCTAssertTrue(largeMultiModel.contains("large"))
         XCTAssertFalse(largeMultiModel.contains(".en"))
         XCTAssertTrue(mockHFRepo.downloadedModels.contains(largeMultiModel))
@@ -448,7 +448,7 @@ final class ModelRepoTests: XCTestCase {
     func testDownloadedModelForLanguages_WithConstraints() async throws {
         mockHFRepo.downloadedModels.removeAll() // Clear any prior mock downloads
         // English-only, minSize .tiny, maxSize .small, multilingual: false
-        let tinyEnModel = try await modelRepo.downloadedModel(forLanguages: ["en"], constraint: ModelConstraint(minimumSize: .tiny, isMultilingual: false, maximumSize: .small))
+        let tinyEnModel = try await modelRepo.downloadedModel(forLanguages: ["en"], constraint: ModelConstraint(sizeRange: ModelSizeRange(minimumSize: .tiny, maximumSize: .small), isMultilingual: false))
         XCTAssertEqual(tinyEnModel, "openai_whisper-tiny.en")
         XCTAssertTrue(mockHFRepo.downloadedModels.contains(tinyEnModel))
         mockHFRepo.downloadedModels.removeAll()
@@ -456,18 +456,18 @@ final class ModelRepoTests: XCTestCase {
         // English-only, minSize .small, maxSize .medium, multilingual: true (could be small.en or small)
         try createMockDownloadedModel("openai_whisper-small.en") // Ensure .en is available and downloaded
         try createMockDownloadedModel("openai_whisper-small")    // Ensure multilingual small is available
-        let smallEnOrMultiModel = try await modelRepo.downloadedModel(forLanguages: ["en"], constraint: ModelConstraint(minimumSize: .small, isMultilingual: true, maximumSize: .medium))
+        let smallEnOrMultiModel = try await modelRepo.downloadedModel(forLanguages: ["en"], constraint: ModelConstraint(sizeRange: ModelSizeRange(minimumSize: .small, maximumSize: .medium), isMultilingual: true))
         
         XCTAssertTrue(["openai_whisper-small.en", "openai_whisper-small"].contains(smallEnOrMultiModel))
 
         // Chinese, minSize .small, maxSize .medium, multilingual: true (must be multilingual, not .en, not tiny)
-        let smallZhModel = try await modelRepo.downloadedModel(forLanguages: ["zh"], constraint: ModelConstraint(minimumSize: .small, isMultilingual: true, maximumSize: .medium))
+        let smallZhModel = try await modelRepo.downloadedModel(forLanguages: ["zh"], constraint: ModelConstraint(sizeRange: ModelSizeRange(minimumSize: .small, maximumSize: .medium), isMultilingual: true))
         XCTAssertEqual(smallZhModel, "openai_whisper-small")
         mockHFRepo.downloadedModels.removeAll()
         
         // Unknown language, minSize .base, maxSize .medium, multilingual: true (should avoid tiny, not .en)
         // "base" is filtered out for "xx" by recommendation logic, "small" is next.
-        let baseXxModel = try await modelRepo.downloadedModel(forLanguages: ["xx"], constraint: ModelConstraint(minimumSize: .base, isMultilingual: true, maximumSize: .medium))
+        let baseXxModel = try await modelRepo.downloadedModel(forLanguages: ["xx"], constraint: ModelConstraint(sizeRange: ModelSizeRange(minimumSize: .base, maximumSize: .medium), isMultilingual: true))
         XCTAssertEqual(baseXxModel, "openai_whisper-small") // Expect small due to "xx" constraint filtering out "base"
     }
 
@@ -668,11 +668,11 @@ final class ModelRepoTests: XCTestCase {
         try createMockDownloadedModel("openai_whisper-tiny")
         
         // Test with small size preference
-        let smallModel = try await modelRepo.downloadedModel(constraint: ModelConstraint(minimumSize: .small, isMultilingual: true, maximumSize: .medium))
+        let smallModel = try await modelRepo.downloadedModel(constraint: ModelConstraint(sizeRange: ModelSizeRange(minimumSize: .small, maximumSize: .medium), isMultilingual: true))
         XCTAssertTrue(smallModel.contains("small"), "Should use a small model when preferred")
         
         // Test with large size preference
-        let largeModel = try await modelRepo.downloadedModel(constraint: ModelConstraint(minimumSize: .large, isMultilingual: true, maximumSize: .large))
+        let largeModel = try await modelRepo.downloadedModel(constraint: ModelConstraint(sizeRange: ModelSizeRange(minimumSize: .large, maximumSize: .large), isMultilingual: true))
         XCTAssertTrue(largeModel.contains("large"), "Should use a large model when preferred")
         
         // Test with invalid size preference - should fall back to the best *downloaded* model
@@ -681,7 +681,7 @@ final class ModelRepoTests: XCTestCase {
         // If not, it might download 'openai_whisper-base'.
         // Let's ensure 'openai_whisper-base' is downloaded for a predictable test.
         try createMockDownloadedModel("openai_whisper-base")
-        let invalidModel = try await modelRepo.downloadedModel(constraint: ModelConstraint(minimumSize: .base, isMultilingual: true, maximumSize: .medium))
+        let invalidModel = try await modelRepo.downloadedModel(constraint: ModelConstraint(sizeRange: ModelSizeRange(minimumSize: .base, maximumSize: .medium), isMultilingual: true))
         XCTAssertEqual(invalidModel, "openai_whisper-base", "Should fall back to the best downloaded model satisfying default criteria")
     }
     
@@ -692,28 +692,28 @@ final class ModelRepoTests: XCTestCase {
         try createMockDownloadedModel("openai_whisper-large")
         
         // Test with small size preference for English
-        let smallEnglishModel = try await modelRepo.downloadedModel(forLanguages: ["en"], constraint: ModelConstraint(minimumSize: .small, isMultilingual: false, maximumSize: .medium))
+        let smallEnglishModel = try await modelRepo.downloadedModel(forLanguages: ["en"], constraint: ModelConstraint(sizeRange: ModelSizeRange(minimumSize: .small, maximumSize: .medium), isMultilingual: false))
         XCTAssertTrue(smallEnglishModel.contains("small"), "Should use a small model for English")
         
         // Test with large size preference for English
-        let largeEnglishModel = try await modelRepo.downloadedModel(forLanguages: ["en"], constraint: ModelConstraint(minimumSize: .large, isMultilingual: false, maximumSize: .large))
+        let largeEnglishModel = try await modelRepo.downloadedModel(forLanguages: ["en"], constraint: ModelConstraint(sizeRange: ModelSizeRange(minimumSize: .large, maximumSize: .large), isMultilingual: false))
         XCTAssertEqual(largeEnglishModel, "openai_whisper-base", "Should fallback to default model when large.en is not available")
         
         // Test with tiny size preference for English-specific model
-        let tinyEnglishModel = try await modelRepo.downloadedModel(forLanguages: ["en"], constraint: ModelConstraint(minimumSize: .tiny, isMultilingual: false, maximumSize: .small))
+        let tinyEnglishModel = try await modelRepo.downloadedModel(forLanguages: ["en"], constraint: ModelConstraint(sizeRange: ModelSizeRange(minimumSize: .tiny, maximumSize: .small), isMultilingual: false))
         XCTAssertTrue(tinyEnglishModel.contains("tiny.en"), "Should use tiny.en model for English")
         
         // Test with tiny size preference for Chinese (should not use tiny due to complexity)
         // It will pick 'openai_whisper-small' as it's the smallest multilingual non-tiny/non-base model by default for "zh".
         try createMockDownloadedModel("openai_whisper-small") // Ensure small is available
-        let chineseModel = try await modelRepo.downloadedModel(forLanguages: ["zh"], constraint: ModelConstraint(minimumSize: .base, isMultilingual: true, maximumSize: .medium))
+        let chineseModel = try await modelRepo.downloadedModel(forLanguages: ["zh"], constraint: ModelConstraint(sizeRange: ModelSizeRange(minimumSize: .base, maximumSize: .medium), isMultilingual: true))
         XCTAssertFalse(chineseModel.contains("tiny"), "Should not use tiny model for Chinese")
         XCTAssertTrue(chineseModel.contains("small"), "Should use at least small for Chinese")
         
         // Test with tiny size preference for unknown language (should be treated as low-resourced)
         // Similar to Chinese, it will pick 'openai_whisper-small'.
         try createMockDownloadedModel("openai_whisper-small") // Ensure small is available
-        let unknownModel = try await modelRepo.downloadedModel(forLanguages: ["xx"], constraint: ModelConstraint(minimumSize: .base, isMultilingual: true, maximumSize: .medium))
+        let unknownModel = try await modelRepo.downloadedModel(forLanguages: ["xx"], constraint: ModelConstraint(sizeRange: ModelSizeRange(minimumSize: .base, maximumSize: .medium), isMultilingual: true))
         XCTAssertFalse(unknownModel.contains("tiny"), "Should not use tiny model for unknown language")
         XCTAssertTrue(unknownModel.contains("small"), "Should use at least small for unknown language")
     }
